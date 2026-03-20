@@ -1,0 +1,45 @@
+# Outputs & checkpoints
+outputs/
+logs/
+ckpt/
+*.pt
+*.safetensors
+*.ckpt
+
+# HuggingFace / model cache
+.hf-cache/
+.cache/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.so
+
+# Wandb
+wandb/
+src/wandb/
+
+# Data
+*.nii
+*.nii.gz
+*.h5
+*.hdf5
+
+# Environment
+.env
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
