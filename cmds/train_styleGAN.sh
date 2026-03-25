@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-export TRAIN_DATA_DIR="/path/to/data"
+export TRAIN_DATA_DIR="/mnt/data/jliu452/Data/Dataset901_SMILE/h5"
 
 cd ../src
 accelerate launch --num_processes=1 train_klvae.py \

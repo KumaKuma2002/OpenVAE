@@ -2,13 +2,14 @@
 """
 Benchmark metric plot (matplotlib, non-interactive).
 
-PNG: **OOD cohort only** (DSB + LUNA), 1×4 subplots — zoomed y-axis to show spread.
+PNG: **OOD cohort only** (DSB + LUNA), 1×5 subplots — zoomed y-axis to show spread.
+Metric order: MAE_100, Detail_100, SSIM, PSNR, LPIPS
 
-TXT/CSV: **all cohorts** (all / within / OOD), unchanged scope.
+TXT/CSV: **all cohorts** (all / within / OOD), same metric order.
 
 SOTA per subplot: grey-orange bar; others gray. OpenVAE-2D-4x-2K excluded.
 
-Do not run on login node; use SLURM (see z_openvae/plot_benchmark.slurm).
+Do not run on login node; use SLURM if your cluster disallows plotting on login.
 
 Usage:
   python plot_benchmark_metrics.py --out_dir ../outputs/vae_benchmark/visualization
@@ -35,6 +36,15 @@ EXCLUDED_MODEL_NAMES = frozenset({"OpenVAE-2D-4x-2K"})
 BAR_GRAY = "#A8A8A8"
 BAR_SOTA_GREY_ORANGE = "#C4894A"  # muted grey-orange
 
+# Display / table column order (matches benchmark priority)
+METRIC_ORDER: List[Tuple[str, str, bool]] = [
+    ("MAE_100", "MAE_100", True),
+    ("Detail_100", "Detail_100", True),
+    ("SSIM", "SSIM", True),
+    ("PSNR", "PSNR (dB)", True),
+    ("LPIPS", "LPIPS", False),
+]
+
 
 def patient_cohort(input_ct: str) -> str:
     """Return 'ood' for DSB_/LUNA_, else 'within'."""
@@ -43,6 +53,13 @@ def patient_cohort(input_ct: str) -> str:
     if stem.startswith("DSB_") or stem.startswith("LUNA_"):
         return "ood"
     return "within"
+
+
+def _parse_float_cell(row: dict, key: str) -> float:
+    s = row.get(key, "").strip()
+    if not s or s.lower() == "nan":
+        return float("nan")
+    return float(s)
 
 
 def load_all_metrics(benchmark_root: Path) -> Dict[str, List[dict]]:
@@ -57,7 +74,8 @@ def load_all_metrics(benchmark_root: Path) -> Dict[str, List[dict]]:
                     cohort = patient_cohort(row["input_ct"])
                     psnr = float(row["PSNR"])
                     ssim = float(row["SSIM"])
-                    d100 = float(row.get("Detail_100", "nan"))
+                    mae100 = _parse_float_cell(row, "MAE_100")
+                    d100 = _parse_float_cell(row, "Detail_100")
                     lp_s = row.get("LPIPS", "").strip()
                     if lp_s and lp_s.lower() != "nan":
                         lp = float(lp_s)
@@ -66,6 +84,7 @@ def load_all_metrics(benchmark_root: Path) -> Dict[str, List[dict]]:
                     by_model[model].append(
                         {
                             "cohort": cohort,
+                            "MAE_100": mae100,
                             "PSNR": psnr,
                             "SSIM": ssim,
                             "LPIPS": lp,
@@ -78,10 +97,11 @@ def load_all_metrics(benchmark_root: Path) -> Dict[str, List[dict]]:
 
 
 def mean_metrics(rows: List[dict]) -> Dict[str, float]:
+    keys = ("MAE_100", "PSNR", "SSIM", "Detail_100", "LPIPS")
     if not rows:
-        return {"PSNR": float("nan"), "SSIM": float("nan"), "LPIPS": float("nan"), "Detail_100": float("nan")}
-    out = {}
-    for k in ("PSNR", "SSIM", "Detail_100"):
+        return {k: float("nan") for k in keys}
+    out: Dict[str, float] = {}
+    for k in ("MAE_100", "PSNR", "SSIM", "Detail_100"):
         vals = [r[k] for r in rows if not math.isnan(r[k])]
         out[k] = float(np.mean(vals)) if vals else float("nan")
     lp = [r["LPIPS"] for r in rows if not math.isnan(r["LPIPS"])]
@@ -94,7 +114,7 @@ def build_cohort_tables(
 ) -> Tuple[Dict[str, Dict[str, Dict[str, float]]], List[str]]:
     """
     Returns:
-      tables[cohort_key][model_name] = {PSNR, SSIM, LPIPS, Detail_100}
+      tables[cohort_key][model_name] = {MAE_100, Detail_100, PSNR, SSIM, LPIPS}
       cohort_key in 'all', 'within', 'ood'
     """
     models = sorted(by_model.keys())
@@ -124,7 +144,6 @@ def _tight_ylim(ax, vals: np.ndarray) -> None:
     vmin = float(np.nanmin(vals[valid]))
     vmax = float(np.nanmax(vals[valid]))
     span = max(vmax - vmin, 1e-12)
-    # 10% margin; if nearly flat, inflate band so bars don't look identical
     pad = max(span * 0.10, span * 0.02 + 1e-6)
     if span < 1e-6 * max(abs(vmax), 1.0):
         pad = max(0.02 * max(abs(vmax), 1.0), 0.005)
@@ -132,15 +151,15 @@ def _tight_ylim(ax, vals: np.ndarray) -> None:
     ax.set_ylim(lo, hi)
 
 
-def sort_models_ood_by_detail_100(
+def sort_models_ood_by_mae_100(
     models: List[str], ood_tab: Dict[str, Dict[str, float]]
 ) -> List[str]:
     """
-    Left → right: strongest to weakest by OOD mean Detail_100 (primary rank).
-    NaN Detail_100 sorts last.
+    Left → right: strongest to weakest by OOD mean MAE_100 (primary rank).
+    NaN MAE_100 sorts last.
     """
     def sort_key(m: str) -> float:
-        v = ood_tab[m]["Detail_100"]
+        v = ood_tab[m]["MAE_100"]
         return float("-inf") if math.isnan(v) else float(v)
 
     return sorted(models, key=sort_key, reverse=True)
@@ -165,24 +184,18 @@ def plot_ood_row_only(
     rk = "ood"
     rtitle = "OOD (DSB & LUNA)"
     tab = tables[rk]
-    # Same x order in all subplots: strong → weak by OOD Detail_100
-    models_ord = sort_models_ood_by_detail_100(models, tab)
-    metrics = [
-        ("PSNR", "PSNR (dB)", True),
-        ("SSIM", "SSIM", True),
-        ("LPIPS", "LPIPS", False),
-        ("Detail_100", "Detail_100", True),
-    ]
+    models_ord = sort_models_ood_by_mae_100(models, tab)
 
     n_models = len(models_ord)
     x = np.arange(n_models)
-    fig, axes = plt.subplots(1, 4, figsize=(20, 5.5), constrained_layout=True)
+    ncols = len(METRIC_ORDER)
+    fig, axes = plt.subplots(1, ncols, figsize=(4.2 * ncols + 2, 5.5), constrained_layout=True)
     if not isinstance(axes, np.ndarray):
         axes = np.array([axes])
 
     sota_name = models_ord[0] if models_ord else "n/a"
 
-    for ci, (mkey, mlabel, higher) in enumerate(metrics):
+    for ci, (mkey, mlabel, higher) in enumerate(METRIC_ORDER):
         ax = axes[ci]
         vals = np.array([tab[m][mkey] for m in models_ord], dtype=float)
         bi = best_model_index(vals, higher)
@@ -208,7 +221,7 @@ def plot_ood_row_only(
     axes[0].text(
         -0.02,
         1.18,
-        f"{rtitle}\nOrder: Detail_100 (strong→weak)  |  SOTA: {sota_name}",
+        f"{rtitle}\nOrder: MAE_100 (strong→weak)  |  SOTA: {sota_name}",
         transform=axes[0].transAxes,
         fontsize=10,
         fontweight="bold",
@@ -218,9 +231,9 @@ def plot_ood_row_only(
 
     fig.suptitle(
         "VAE benchmark — OOD only (excl. OpenVAE-2D-4x-2K). "
-        "Bars left→right: OOD Detail_100 rank (strongest to weakest). "
-        "Grey-orange = best per metric in that subplot; "
-        "leftmost is best Detail_100 only. Y-axis zoomed.",
+        "Bars left→right: OOD MAE_100 rank (strongest to weakest). "
+        "Panels: MAE_100, Detail_100, SSIM, PSNR, LPIPS. "
+        "Grey-orange = best per subplot; leftmost is best MAE_100 only. Y-axis zoomed.",
         fontsize=10,
         y=1.08,
     )
@@ -240,11 +253,14 @@ def write_txt_and_csv(
     lines.append("VAE benchmark — cohort averages (full tables)")
     lines.append("Excluded models: OpenVAE-2D-4x-2K")
     lines.append(
-        "Note: PNG figure metric_comparison_OOD_1x4.png shows OOD cohort only; "
+        "Note: PNG metric_comparison_OOD_1x5.png shows OOD cohort only; "
         "this file lists all cohorts (all / within / OOD)."
     )
-    lines.append("SOTA (per row) = highest mean Detail_100 in that cohort.")
+    lines.append("SOTA (per row) = highest mean MAE_100 in that cohort.")
     lines.append("")
+
+    col_headers = ("MAE_100", "Detail_100", "SSIM", "PSNR", "LPIPS")
+    widths = (12, 12, 10, 10, 10)
 
     for rk, title in [
         ("all", "ALL PATIENTS"),
@@ -255,28 +271,37 @@ def write_txt_and_csv(
         lines.append(title)
         lines.append("=" * 72)
         tab = tables[rk]
-        dlist = [(m, tab[m]["Detail_100"]) for m in models]
-        dlist_valid = [(m, v) for m, v in dlist if not math.isnan(v)]
-        sota = max(dlist_valid, key=lambda t: t[1])[0] if dlist_valid else "n/a"
-        lines.append(f"Row SOTA (Detail_100): {sota}")
+        mlist = [(m, tab[m]["MAE_100"]) for m in models]
+        mlist_valid = [(m, v) for m, v in mlist if not math.isnan(v)]
+        sota = max(mlist_valid, key=lambda t: t[1])[0] if mlist_valid else "n/a"
+        lines.append(f"Row SOTA (MAE_100): {sota}")
         lines.append("")
-        header = f"{'model':<32} {'PSNR':>10} {'SSIM':>10} {'LPIPS':>10} {'Detail_100':>12}"
+        header = f"{'model':<32}"
+        for w, h in zip(widths, col_headers):
+            header += f" {h:>{w}}"
         lines.append(header)
         lines.append("-" * len(header))
         for m in models:
             t = tab[m]
             lp = t["LPIPS"]
             lps = f"{lp:.6f}" if not math.isnan(lp) else "nan"
+            maes = f"{t['MAE_100']:12.4f}" if not math.isnan(t["MAE_100"]) else f"{'nan':>12}"
             lines.append(
-                f"{m:<32} {t['PSNR']:10.4f} {t['SSIM']:10.6f} {lps:>10} {t['Detail_100']:12.4f}"
+                f"{m:<32}"
+                f" {maes}"
+                f" {t['Detail_100']:12.4f}"
+                f" {t['SSIM']:10.6f}"
+                f" {t['PSNR']:10.4f}"
+                f" {lps:>10}"
             )
         lines.append("")
 
     out_txt.write_text("\n".join(lines))
 
+    csv_cols = ["cohort", "model", "MAE_100", "Detail_100", "SSIM", "PSNR", "LPIPS"]
     with out_csv.open("w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["cohort", "model", "PSNR", "SSIM", "LPIPS", "Detail_100"])
+        w.writerow(csv_cols)
         for rk in ("all", "within", "ood"):
             for m in models:
                 t = tables[rk][m]
@@ -284,10 +309,11 @@ def write_txt_and_csv(
                     [
                         rk,
                         m,
-                        t["PSNR"],
-                        t["SSIM"],
-                        t["LPIPS"] if not math.isnan(t["LPIPS"]) else "",
+                        t["MAE_100"] if not math.isnan(t["MAE_100"]) else "",
                         t["Detail_100"],
+                        t["SSIM"],
+                        t["PSNR"],
+                        t["LPIPS"] if not math.isnan(t["LPIPS"]) else "",
                     ]
                 )
 
@@ -327,7 +353,7 @@ def main() -> None:
 
     tables, models = build_cohort_tables(by_model)
 
-    plot_ood_row_only(tables, models, out_dir / "metric_comparison_OOD_1x4.png")
+    plot_ood_row_only(tables, models, out_dir / "metric_comparison_OOD_1x5.png")
     write_txt_and_csv(
         tables,
         models,
@@ -335,10 +361,10 @@ def main() -> None:
         out_dir / "cohort_averages.csv",
     )
 
-    # small README in visualization folder
     (out_dir / "README.txt").write_text(
-        """metric_comparison_OOD_1x4.png — OOD cohort (DSB + LUNA) only, 1×4 metrics.
-Bars left→right: OOD mean Detail_100, strongest to weakest.
+        """metric_comparison_OOD_1x5.png — OOD cohort (DSB + LUNA) only, 1×5 metrics.
+Panels (left to right): MAE_100, Detail_100, SSIM, PSNR, LPIPS.
+Bars left→right: OOD mean MAE_100, strongest to weakest.
 Grey-orange = best bar in that subplot (per-metric SOTA). Y-axis zoomed.
 OpenVAE-2D-4x-2K excluded from plot/tables.
 

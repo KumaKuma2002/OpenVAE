@@ -15,20 +15,44 @@ Data format (same as train_klvae.py):
       ct.h5
     ...
 
-Usage example:
+Usage examples:
+
+  # Train from scratch
   python src/train_3dvae.py \
       --train_data_dir /data/AbdomenAtlasPro \
-      --patch_size 64 64 64 \
-      --num_epochs 100 \
-      --random_aug \
-      --amp
+      --output_dir outputs/3dvae-patchgan \
+      --num_epochs 100 --random_aug --amp
+
+  # Fine-tune from official MAISI pretrained autoencoder
+  #   Downloads autoencoder.pt from HuggingFace MONAI/maisi_ct_generative
+  #   and initialises the autoencoder only (discriminator trains from scratch).
+  python src/train_3dvae.py \
+      --train_data_dir /data/AbdomenAtlasPro \
+      --output_dir outputs/3dvae-maisi-ft \
+      --resume_from_checkpoint maisi \
+      --num_epochs 100 --random_aug --amp
+
+  # Resume from a previous run (loads both autoencoder + discriminator)
+  python src/train_3dvae.py \
+      --train_data_dir /data/AbdomenAtlasPro \
+      --output_dir outputs/3dvae-patchgan \
+      --resume_from_checkpoint outputs/3dvae-patchgan/models \
+      --num_epochs 200 --random_aug --amp
+
+Notes on --resume_from_checkpoint:
+  Accepts three formats:
+    "maisi"            -> auto-download official MAISI autoencoder (autoencoder only)
+    "/path/to/file.pt" -> load a single .pt autoencoder checkpoint (autoencoder only)
+    "/path/to/dir/"    -> load autoencoder_latest.pt + discriminator_latest.pt from dir
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import random
+import time
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import h5py
@@ -45,13 +69,42 @@ try:
     from monai.losses.adversarial_loss import PatchAdversarialLoss
     from monai.losses.perceptual import PerceptualLoss
     from monai.networks.nets import PatchDiscriminator
-    
+
 except ModuleNotFoundError as e:
     raise ModuleNotFoundError(
         "Missing dependency `monai`. Install it before running this script, e.g.\n"
         "  pip install -U 'monai-weekly[nibabel, tqdm]'\n"
         "Ensure your MONAI version includes monai.apps.generation.maisi networks."
     ) from e
+
+MAISI_AUTOENCODER_URL = (
+    "https://huggingface.co/MONAI/maisi_ct_generative/resolve/1.0.1/models/autoencoder.pt"
+)
+
+
+def download_maisi_checkpoint(dest_dir: str) -> str:
+    """Download the official MAISI autoencoder if not cached."""
+    os.makedirs(dest_dir, exist_ok=True)
+    dest = os.path.join(dest_dir, "maisi_autoencoder.pt")
+    if os.path.isfile(dest):
+        print(f"[train_3dvae] MAISI checkpoint cached: {dest}")
+        return dest
+    print("[train_3dvae] Downloading MAISI autoencoder from HuggingFace ...")
+    try:
+        from huggingface_hub import hf_hub_download
+        path = hf_hub_download(
+            repo_id="MONAI/maisi_ct_generative",
+            filename="models/autoencoder.pt",
+            revision="1.0.1",
+            local_dir=dest_dir,
+        )
+        if path != dest:
+            os.replace(path, dest)
+    except ImportError:
+        import urllib.request
+        urllib.request.urlretrieve(MAISI_AUTOENCODER_URL, dest)
+    print(f"[train_3dvae] Saved to: {dest}")
+    return dest
 
 
 # ---------------------------------------------------------------------------
@@ -85,7 +138,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_epochs", type=int, default=100)
     parser.add_argument("--train_batch_size", type=int, default=1)
     parser.add_argument("--val_batch_size", type=int, default=1)
-    parser.add_argument("--dataloader_num_workers", type=int, default=0)
+    parser.add_argument("--dataloader_num_workers", type=int, default=4,
+                        help="DataLoader workers. Set 4-8 for HPC; 0 for debugging.")
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
 
@@ -127,7 +181,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log_steps", type=int, default=20,
                         help="Print training loss every N steps.")
     parser.add_argument("--resume_from_checkpoint", type=str, default=None,
-                        help="Path to a checkpoint directory to resume from.")
+                        help="Resume / fine-tune from checkpoint.  Accepts:\n"
+                             "  'maisi'           -> auto-download MAISI pretrained autoencoder\n"
+                             "  '/path/to/file.pt' -> single autoencoder .pt file\n"
+                             "  '/path/to/dir/'    -> dir with autoencoder_latest.pt + discriminator_latest.pt")
 
     args = parser.parse_args()
     return args
@@ -428,21 +485,28 @@ def main() -> None:
         is_train=False, random_aug=False,
     )
 
+    nw = args.dataloader_num_workers
+    persistent = nw > 0
+
     dataloader_train = DataLoader(
         dataset_train,
         batch_size=args.train_batch_size,
         shuffle=True,
-        num_workers=args.dataloader_num_workers,
+        num_workers=nw,
         pin_memory=(device_type == "cuda"),
         drop_last=True,
+        persistent_workers=persistent,
+        prefetch_factor=2 if nw > 0 else None,
     )
     dataloader_val = DataLoader(
         dataset_val,
         batch_size=args.val_batch_size,
         shuffle=False,
-        num_workers=args.dataloader_num_workers,
+        num_workers=nw,
         pin_memory=(device_type == "cuda"),
         drop_last=False,
+        persistent_workers=persistent,
+        prefetch_factor=2 if nw > 0 else None,
     )
 
     # ------------------------------------------------------------------
@@ -512,21 +576,61 @@ def main() -> None:
     scaler_d = GradScaler(device="cuda", init_scale=2.0 ** 8, growth_factor=1.5) if args.amp else None
 
     # ------------------------------------------------------------------
-    # Resume
+    # Resume / fine-tune
+    #   "maisi"            -> download & load MAISI pretrained autoencoder
+    #   "/path/to/file.pt" -> load single autoencoder state_dict
+    #   "/path/to/dir/"    -> load autoencoder_latest.pt + discriminator_latest.pt
     # ------------------------------------------------------------------
     start_epoch = 0
     best_val_loss = float("inf")
 
     if args.resume_from_checkpoint is not None:
-        ckpt_dir = args.resume_from_checkpoint
-        g_ckpt = os.path.join(ckpt_dir, "autoencoder_latest.pt")
-        d_ckpt = os.path.join(ckpt_dir, "discriminator_latest.pt")
-        if os.path.exists(g_ckpt):
-            autoencoder.load_state_dict(torch.load(g_ckpt, map_location=device))
-            print(f"[train_3dvae] Resumed autoencoder from {g_ckpt}")
-        if os.path.exists(d_ckpt):
-            discriminator.load_state_dict(torch.load(d_ckpt, map_location=device))
-            print(f"[train_3dvae] Resumed discriminator from {d_ckpt}")
+        ckpt = args.resume_from_checkpoint
+
+        if ckpt.lower() == "maisi":
+            cache_dir = os.path.join(args.output_dir, ".maisi_cache")
+            ckpt_path = download_maisi_checkpoint(cache_dir)
+            autoencoder.load_state_dict(
+                torch.load(ckpt_path, map_location=device, weights_only=True)
+            )
+            print(f"[train_3dvae] Initialised autoencoder from MAISI pretrained: {ckpt_path}")
+
+        elif os.path.isfile(ckpt) and ckpt.endswith(".pt"):
+            autoencoder.load_state_dict(
+                torch.load(ckpt, map_location=device, weights_only=True)
+            )
+            print(f"[train_3dvae] Loaded autoencoder from: {ckpt}")
+
+        elif os.path.isdir(ckpt):
+            g_ckpt = os.path.join(ckpt, "autoencoder_latest.pt")
+            d_ckpt = os.path.join(ckpt, "discriminator_latest.pt")
+            if os.path.exists(g_ckpt):
+                autoencoder.load_state_dict(
+                    torch.load(g_ckpt, map_location=device, weights_only=True)
+                )
+                print(f"[train_3dvae] Resumed autoencoder from {g_ckpt}")
+            if os.path.exists(d_ckpt):
+                discriminator.load_state_dict(
+                    torch.load(d_ckpt, map_location=device, weights_only=True)
+                )
+                print(f"[train_3dvae] Resumed discriminator from {d_ckpt}")
+        else:
+            raise FileNotFoundError(
+                f"--resume_from_checkpoint='{ckpt}' is not 'maisi', a .pt file, or a directory."
+            )
+
+    # ------------------------------------------------------------------
+    # Dump config for reproducibility (handy on HPC)
+    # ------------------------------------------------------------------
+    config_path = os.path.join(args.output_dir, "train_config.json")
+    with open(config_path, "w") as f:
+        json.dump(vars(args), f, indent=2, default=str)
+    print(f"[train_3dvae] Config saved to: {config_path}")
+
+    n_params_g = sum(p.numel() for p in autoencoder.parameters()) / 1e6
+    n_params_d = sum(p.numel() for p in discriminator.parameters()) / 1e6
+    print(f"[train_3dvae] Autoencoder: {n_params_g:.1f}M params | Discriminator: {n_params_d:.1f}M params")
+    print(f"[train_3dvae] Batches/epoch: {len(dataloader_train)}")
 
     # ------------------------------------------------------------------
     # Training loop
@@ -535,6 +639,7 @@ def main() -> None:
     print("[train_3dvae] Starting training...")
 
     for epoch in range(start_epoch, args.num_epochs):
+        epoch_t0 = time.time()
         autoencoder.train()
         discriminator.train()
 
@@ -622,6 +727,7 @@ def main() -> None:
             + args.kl_weight * epoch_losses["kl"]
             + args.perceptual_weight * epoch_losses["percep"]
         )
+        epoch_sec = time.time() - epoch_t0
         print(
             f"[train_3dvae] epoch={epoch:04d}  "
             f"vae={train_vae_loss:.5f}  "
@@ -630,7 +736,8 @@ def main() -> None:
             f"percep={epoch_losses['percep']:.5f}  "
             f"gen_adv={epoch_losses['gen_adv']:.5f}  "
             f"disc={epoch_losses['disc']:.5f}  "
-            f"lr_g={scheduler_g.get_last_lr()[0]:.2e}"
+            f"lr_g={scheduler_g.get_last_lr()[0]:.2e}  "
+            f"time={epoch_sec:.0f}s"
         )
         writer.add_scalar("train/vae_loss_epoch",     train_vae_loss,           epoch)
         writer.add_scalar("train/recons_loss_epoch",  epoch_losses["recons"],   epoch)

@@ -7,16 +7,16 @@ with Gaussian-weighted blending for seamless stitching.
 Supports both NIfTI (.nii / .nii.gz) and HDF5 (.h5) inputs.
 
 Usage:
+    # Your trained checkpoint
     python test/test_3dvae.py \
         --input /path/to/ct.nii.gz \
         --checkpoint outputs/3dvae-patchgan/models/autoencoder_best.pt \
-        --output reconstructed.nii.gz
+        --amp
 
+    # Official MAISI pretrained (auto-downloaded)
     python test/test_3dvae.py \
-        --input /path/to/subject_dir/ct.h5 \
-        --checkpoint outputs/3dvae-patchgan/models/autoencoder_best.pt \
-        --patch_size 64 64 64 \
-        --overlap 16 16 16 \
+        --input /path/to/ct.nii.gz \
+        --maisi_ckpt \
         --amp
 """
 
@@ -40,34 +40,75 @@ except ModuleNotFoundError as e:
         "  pip install -U 'monai-weekly[nibabel, tqdm]'\n"
     ) from e
 
+MAISI_AUTOENCODER_URL = (
+    "https://huggingface.co/MONAI/maisi_ct_generative/resolve/1.0.1/models/autoencoder.pt"
+)
+
+
+def download_maisi_checkpoint(dest_dir: str) -> str:
+    """Download the official MAISI autoencoder checkpoint if not already cached."""
+    os.makedirs(dest_dir, exist_ok=True)
+    dest = os.path.join(dest_dir, "maisi_autoencoder.pt")
+    if os.path.isfile(dest):
+        print(f"[test_3dvae] MAISI checkpoint already cached: {dest}")
+        return dest
+    print(f"[test_3dvae] Downloading MAISI autoencoder from HuggingFace ...")
+    try:
+        from huggingface_hub import hf_hub_download
+        path = hf_hub_download(
+            repo_id="MONAI/maisi_ct_generative",
+            filename="models/autoencoder.pt",
+            revision="1.0.1",
+            local_dir=dest_dir,
+        )
+        if path != dest:
+            os.replace(path, dest)
+    except ImportError:
+        import urllib.request
+        urllib.request.urlretrieve(MAISI_AUTOENCODER_URL, dest)
+    print(f"[test_3dvae] Saved to: {dest}")
+    return dest
+
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="3D VAE inference on CT volumes.")
 
     p.add_argument("--input", type=str, required=True,
                    help="Path to input CT: .nii/.nii.gz or .h5 (key='image').")
-    p.add_argument("--checkpoint", type=str, required=True,
-                   help="Path to autoencoder .pt checkpoint (state_dict).")
+    ckpt_group = p.add_mutually_exclusive_group(required=True)
+    ckpt_group.add_argument("--checkpoint", type=str, default=None,
+                            help="Path to autoencoder .pt checkpoint (state_dict).")
+    ckpt_group.add_argument("--maisi_ckpt", action="store_true",
+                            help="Auto-download & use official MAISI pretrained autoencoder.")
     p.add_argument("--output", type=str, default=None,
                    help="Path for the output NIfTI. Defaults to <input_stem>_3dvae_recon.nii.gz.")
 
-    p.add_argument("--patch_size", type=int, nargs=3, default=[64, 64, 64],
-                   help="Inference patch size (H W D). Should match training patch size.")
-    p.add_argument("--overlap", type=int, nargs=3, default=[16, 16, 16],
-                   help="Overlap between adjacent patches for blending (H W D).")
+    p.add_argument("--patch_size", type=int, nargs=3, default=[80, 80, 80],
+                   help="Inference patch size (H W D). MAISI default is 80; training default is 64.")
+    p.add_argument("--overlap", type=int, nargs=3, default=None,
+                   help="Overlap between adjacent patches (H W D). Defaults to 50%% of patch_size.")
+    p.add_argument("--overlap_ratio", type=float, default=0.5,
+                   help="Overlap as a fraction of patch_size (used when --overlap is not given). "
+                        "MAISI uses 0.4; we default to 0.5 for smoother blending.")
 
     # Architecture params – must match the training config
     p.add_argument("--latent_channels", type=int, default=4)
     p.add_argument("--num_splits", type=int, default=1,
-                   help="num_splits for MAISI convolution splitting. Must match training "
-                        "(default=1). Higher values reduce VRAM but require larger patches.")
+                   help="num_splits for MAISI convolution splitting. Does not change weights, "
+                        "only computation strategy. Use 2 for lower VRAM.")
     p.add_argument("--dim_split", type=int, default=1)
 
     p.add_argument("--amp", action="store_true", help="Use float16 autocast.")
     p.add_argument("--device", type=str, default=None,
                    help="Force device (e.g. 'cuda:0', 'cpu'). Auto-detected by default.")
 
-    return p.parse_args()
+    args = p.parse_args()
+
+    if args.overlap is None:
+        r = args.overlap_ratio
+        args.overlap = [int(s * r) for s in args.patch_size]
+
+    return args
 
 
 # ---------------------------------------------------------------------------
@@ -113,17 +154,20 @@ def ct_01_to_hu(vol: np.ndarray) -> np.ndarray:
 # Gaussian blending weight
 # ---------------------------------------------------------------------------
 
-def _gaussian_weight(patch_size, sigma_scale=0.125):
+def _gaussian_weight(patch_size, sigma_scale=0.625, min_weight=0.01):
     """
     3-D Gaussian weighting kernel for overlap blending.
-    Peaks at the centre so boundary artefacts are down-weighted.
+
+    Wider sigma (0.625 vs old 0.125) ensures the weight at patch edges
+    is ~0.08 instead of ~0.0003, giving neighbouring patches meaningful
+    contribution in the overlap zone.  Combined with >=50 % overlap this
+    eliminates visible patch boundaries.
     """
     coords = [np.linspace(-1, 1, s) for s in patch_size]
     grid = np.meshgrid(*coords, indexing="ij")
-    sigma = sigma_scale * 2
-    w = np.exp(-sum(g ** 2 for g in grid) / (2 * sigma ** 2))
+    w = np.exp(-sum(g ** 2 for g in grid) / (2 * sigma_scale ** 2))
     w = w / w.max()
-    w = np.clip(w, 1e-6, None)
+    w = np.clip(w, min_weight, None)
     return w.astype(np.float32)
 
 
@@ -270,6 +314,10 @@ def main() -> None:
     print(f"[test_3dvae] device={device}  amp={args.amp}")
 
     # ---- Load model -------------------------------------------------------
+    if args.maisi_ckpt:
+        cache_dir = os.path.join(os.path.dirname(__file__), "..", "ckpt", "MAISI")
+        args.checkpoint = download_maisi_checkpoint(cache_dir)
+
     autoencoder = build_autoencoder(args, device)
     state_dict = torch.load(args.checkpoint, map_location=device, weights_only=True)
     autoencoder.load_state_dict(state_dict)

@@ -184,13 +184,12 @@ def build_3d_model(device: torch.device, amp: bool, num_splits: int, dim_split: 
     ).to(device)
 
 
-def gaussian_weight(patch_size: Tuple[int, int, int], sigma_scale: float = 0.125) -> np.ndarray:
+def gaussian_weight(patch_size: Tuple[int, int, int], sigma_scale: float = 0.625, min_weight: float = 0.01) -> np.ndarray:
     coords = [np.linspace(-1, 1, s) for s in patch_size]
     grid = np.meshgrid(*coords, indexing='ij')
-    sigma = sigma_scale * 2
-    w = np.exp(-sum(g ** 2 for g in grid) / (2 * sigma ** 2))
+    w = np.exp(-sum(g ** 2 for g in grid) / (2 * sigma_scale ** 2))
     w = w / w.max()
-    return np.clip(w, 1e-6, None).astype(np.float32)
+    return np.clip(w, min_weight, None).astype(np.float32)
 
 
 def reconstruct_3d(model: AutoencoderKlMaisi, vol_hu: np.ndarray, patch_size: Tuple[int, int, int], overlap: Tuple[int, int, int], device: torch.device, amp: bool) -> np.ndarray:
