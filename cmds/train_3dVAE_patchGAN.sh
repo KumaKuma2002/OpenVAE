@@ -2,21 +2,23 @@
 # -----------------------------------------------------------------------
 # Train 3D VAE with PatchGAN discriminator
 #
+# NIfTI data: add  --use-nifti  (expects train_data_dir/<id>/ct.nii.gz or ct.nii)
+#
 # Modes:
 #   1) Train from scratch  (default, comment out --resume_from_checkpoint)
 #   2) Fine-tune from MAISI pretrained  (--resume_from_checkpoint maisi)
 #   3) Resume a previous run  (--resume_from_checkpoint <models_dir>)
 # -----------------------------------------------------------------------
 
-export TRAIN_DATA_DIR="/mnt/data/jliu452/Data/Dataset901_SMILE/h5"
+export TRAIN_DATA_DIR="/projects/bodymaps/jliu452/Data/Dataset901_SMILE/PT_H5"
 
 cd ../src
 python train_3dvae.py \
   --train_data_dir=$TRAIN_DATA_DIR \
   --output_dir="../outputs/3dvae-patchgan" \
   --patch_size 64 64 64 \
-  --num_epochs 100 \
-  --train_batch_size=1 \
+  --num_epochs 100000 \
+  --train_batch_size=8 \
   --val_batch_size=1 \
   --dataloader_num_workers=4 \
   --learning_rate=1e-4 \
@@ -29,6 +31,7 @@ python train_3dvae.py \
   --log_steps=20 \
   --random_aug \
   --amp \
-  --seed=0
+  --seed=0 \
+  --resume_from_checkpoint "/projects/bodymaps/jliu452/OpenVAE/ckpt/MAISI.pt"
   # --resume_from_checkpoint maisi          # uncomment to fine-tune from MAISI
   # --resume_from_checkpoint ../outputs/3dvae-patchgan/models  # uncomment to resume

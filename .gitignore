@@ -29,6 +29,9 @@ src/wandb/
 *.h5
 *.hdf5
 
+# Secrets (never commit)
+mytoken.txt
+
 # Environment
 .env
 *.log

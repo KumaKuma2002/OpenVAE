@@ -1,7 +1,7 @@
 """
 Auxiliary loss functions for MIRA3D super-resolution LDM training.
 
-Ported from MIRA-STEP3-SRModel/utils_loss.py (2D) to 3D volumes.
+Ported from MIRA2D/utils_loss.py (2D) to 3D volumes.
 All image tensors are expected in HU domain [-1000, 1000] unless noted.
 """
 
@@ -11,7 +11,6 @@ import json
 from typing import Dict, Tuple
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 
 
@@ -176,56 +175,3 @@ def segmentation_loss(
         return torch.tensor(0.0, device=pred_logits.device)
     return ce
 
-
-# ---------------------------------------------------------------------------
-# Cycle consistency loss
-# ---------------------------------------------------------------------------
-
-def cycle_consistency_loss(
-    vae,
-    unet,
-    scheduler,
-    estimated_z: torch.Tensor,
-    cond_z: torch.Tensor,
-    original_lr_01: torch.Tensor,
-    device: torch.device,
-    amp: bool = False,
-) -> torch.Tensor:
-    """
-    Cycle loss: encode estimated HR → add noise → denoise conditioned on LR
-    → decode → compare with original LR in [0,1].
-
-    This enforces structural consistency: SR(degrade(x)) should recover x.
-    """
-    B = estimated_z.shape[0]
-    noise = torch.randn_like(estimated_z)
-    t = torch.randint(0, scheduler.num_train_timesteps, (B,), device=device)
-    noisy_est = scheduler.add_noise(original_model_output=estimated_z, noise=noise, timesteps=t)
-
-    unet_input = torch.cat([noisy_est, cond_z], dim=1)
-    with torch.autocast(device_type=device.type, enabled=amp):
-        cycle_noise_pred = unet(unet_input, timesteps=t)
-
-    cycle_z = estimated_z - noise + cycle_noise_pred
-    with torch.no_grad():
-        cycle_recon = vae.decode(cycle_z)
-
-    cycle_recon_01 = ((cycle_recon.clamp(-1000, 1000) + 1000.0) / 2000.0)
-    return F.mse_loss(cycle_recon_01, original_lr_01)
-
-
-# ---------------------------------------------------------------------------
-# Uncertainty-weighted multi-task loss (from Kendall et al. 2018)
-# ---------------------------------------------------------------------------
-
-class UncertaintyWeightedLoss(nn.Module):
-    def __init__(self, num_tasks: int):
-        super().__init__()
-        self.log_vars = nn.Parameter(torch.zeros(num_tasks))
-
-    def forward(self, losses: list[torch.Tensor]) -> torch.Tensor:
-        total = torch.tensor(0.0, device=self.log_vars.device)
-        for i, loss in enumerate(losses):
-            precision = torch.exp(-self.log_vars[i])
-            total = total + precision * loss + self.log_vars[i]
-        return total

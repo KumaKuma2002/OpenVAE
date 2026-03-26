@@ -10,9 +10,9 @@ This script is inspired by the MONAI MAISI VAE tutorial:
 Data format (same as train_klvae.py):
   train_data_dir/
     <subject_id>/
-      ct.h5          <- HDF5 file, key "image", shape (H, W, D), HU values
+      ct.h5          <- HDF5 file, key "image", shape (H, W, D), HU values (default)
     <subject_id>/
-      ct.h5
+      ct.nii.gz      <- NIfTI volume, same HU range (with --use-nifti)
     ...
 
 Usage examples:
@@ -22,6 +22,12 @@ Usage examples:
       --train_data_dir /data/AbdomenAtlasPro \
       --output_dir outputs/3dvae-patchgan \
       --num_epochs 100 --random_aug --amp
+
+  # NIfTI layout: each subject folder contains ct.nii.gz or ct.nii
+  python src/train_3dvae.py \
+      --train_data_dir /data/AbdomenAtlasPro \
+      --output_dir outputs/3dvae-nifti \
+      --use-nifti --num_epochs 100 --random_aug --amp
 
   # Fine-tune from official MAISI pretrained autoencoder
   #   Downloads autoencoder.pt from HuggingFace MONAI/maisi_ct_generative
@@ -117,7 +123,11 @@ def parse_args() -> argparse.Namespace:
     # Data
     parser.add_argument(
         "--train_data_dir", type=str, required=True,
-        help="Root dir whose immediate subdirs each contain a ct.h5 (same layout as train_klvae.py).",
+        help="Root dir whose immediate subdirs each contain ct.h5 (default) or ct.nii.gz / ct.nii (--use-nifti).",
+    )
+    parser.add_argument(
+        "--use-nifti", action="store_true",
+        help="Load volumes from ct.nii.gz or ct.nii per subject (requires nibabel). Default is ct.h5.",
     )
     parser.add_argument(
         "--val_data_dir", type=str, default=None,
@@ -202,30 +212,36 @@ def seed_everything(seed: int) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Data discovery  (mirrors train_klvae.py exactly)
+# Data discovery  (mirrors train_klvae.py; optional NIfTI per subject)
 # ---------------------------------------------------------------------------
 
-def get_ct_dir_list(root_dir: str) -> List[str]:
-    """
-    Return sorted list of subject **directory** paths that contain ct.h5,
-    identical to how train_klvae.py builds dataset["train"].
+def resolve_ct_file_path(subject_dir: str, use_nifti: bool) -> Optional[str]:
+    """Absolute path to the CT volume file inside subject_dir, or None if missing."""
+    if use_nifti:
+        for name in ("ct.nii.gz", "ct.nii"):
+            p = os.path.join(subject_dir, name)
+            if os.path.isfile(p):
+                return p
+        return None
+    p = os.path.join(subject_dir, "ct.h5")
+    return p if os.path.isfile(p) else None
 
-    Layout expected:
-        root_dir/
-            subject_A/ct.h5
-            subject_B/ct.h5
-            ...
 
-    Returns paths like ["/data/.../subject_A/", "/data/.../subject_B/", ...]
-    (trailing separator from str.replace so os.path.join still works correctly).
+def get_ct_dir_list(root_dir: str, use_nifti: bool = False) -> List[str]:
     """
-    top_entries = [entry.path for entry in os.scandir(root_dir)]
-    ct_dirs = sorted(
-        entry.path.replace("ct.h5", "")
-        for path in top_entries
-        for entry in os.scandir(path)
-        if entry.name == "ct.h5"
-    )
+    Return sorted list of subject **directory** paths that contain a CT volume.
+
+    Default (HDF5): each immediate subdir of root_dir contains ct.h5
+    (--use-nifti): each subdir contains ct.nii.gz or ct.nii (prefer .nii.gz)
+
+    Returns paths like ["/data/.../subject_A", "/data/.../subject_B", ...]
+    """
+    ct_dirs: List[str] = []
+    for entry in sorted(os.scandir(root_dir), key=lambda e: e.name):
+        if not entry.is_dir(follow_symlinks=False):
+            continue
+        if resolve_ct_file_path(entry.path, use_nifti) is not None:
+            ct_dirs.append(entry.path)
     return ct_dirs
 
 
@@ -233,26 +249,43 @@ def get_ct_dir_list(root_dir: str) -> List[str]:
 # CT loading  (mirrors load_CT_slice from train_klvae.py, but 3-D)
 # ---------------------------------------------------------------------------
 
+def _normalize_hu_volume(vol: np.ndarray) -> np.ndarray:
+    """Clip HU to [-1000, 1000] and scale to [0, 1]."""
+    vol = np.asarray(vol, dtype=np.float32)
+    vol[vol > 1000.0] = 1000.0
+    vol[vol < -1000.0] = -1000.0
+    return (vol + 1000.0) / 2000.0
+
+
 def load_CT_volume(ct_path: str) -> np.ndarray:
     """
-    Load the full 3-D CT volume from an HDF5 file.
+    Load the full 3-D CT volume from HDF5 (ct.h5) or NIfTI (.nii / .nii.gz).
 
-    Mirrors load_CT_slice() in train_klvae.py:
-      - key "image", shape (H, W, D), HU values in [-1000, 1000]
+    Same preprocessing as train_klvae-style loaders:
+      - shape (H, W, D), HU values in [-1000, 1000]
       - clips to [-1000, 1000], normalizes to [0, 1]
       - on IO error: returns zeros (H=512, W=512, D=64) as safe fallback
 
     Returns: float32 ndarray of shape (H, W, D) in [0, 1]
     """
     try:
-        with h5py.File(ct_path, "r") as hf:
-            vol = hf["image"][...]           # (H, W, D)
+        if ct_path.endswith(".h5"):
+            with h5py.File(ct_path, "r") as hf:
+                vol = hf["image"][...]
+        elif ct_path.endswith(".nii.gz") or ct_path.endswith(".nii"):
+            try:
+                import nibabel as nib
+            except ImportError as e:
+                raise ImportError(
+                    "nibabel is required for NIfTI volumes. Install e.g.\n"
+                    "  pip install -U nibabel\n"
+                    "or  pip install -U 'monai-weekly[nibabel, tqdm]'"
+                ) from e
+            vol = np.asarray(nib.load(ct_path).get_fdata(), dtype=np.float32)
+        else:
+            raise ValueError(f"Unsupported CT file extension: {ct_path}")
 
-        vol = np.asarray(vol, dtype=np.float32)
-        vol[vol > 1000.0] = 1000.0
-        vol[vol < -1000.0] = -1000.0
-        vol = (vol + 1000.0) / 2000.0       # [0, 1]
-        return vol
+        return _normalize_hu_volume(vol)
 
     except Exception as exc:
         print(f"[WARNING] Failed to load CT volume from {ct_path}: {exc}")
@@ -331,11 +364,11 @@ def random_augment_3d(vol: np.ndarray) -> np.ndarray:
 
 class CT3DDataset(Dataset):
     """
-    3-D patch dataset for CT volumes stored as HDF5 files.
+    3-D patch dataset for CT volumes (HDF5 ct.h5 or NIfTI ct.nii.gz / ct.nii).
 
     Matches the data convention of train_klvae.py:
       - ct_dir_list: list of **directory** paths (not file paths)
-      - constructs os.path.join(ct_dir, "ct.h5") internally
+      - resolves ct.h5 vs NIfTI via use_nifti
       - same HU clipping + [0,1] normalisation as load_CT_slice
     """
 
@@ -345,18 +378,24 @@ class CT3DDataset(Dataset):
         patch_size: Tuple[int, int, int],
         is_train: bool = True,
         random_aug: bool = False,
+        use_nifti: bool = False,
     ) -> None:
         self.ct_dir_list = list(ct_dir_list)
         self.patch_size = patch_size
         self.is_train = is_train
         self.random_aug = random_aug
+        self.use_nifti = use_nifti
 
     def __len__(self) -> int:
         return len(self.ct_dir_list)
 
     def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
         ct_dir = self.ct_dir_list[index]
-        ct_path = os.path.join(ct_dir, "ct.h5")
+        ct_path = resolve_ct_file_path(ct_dir, self.use_nifti)
+        if ct_path is None:
+            raise FileNotFoundError(
+                f"No CT file found in {ct_dir} (use_nifti={self.use_nifti})"
+            )
 
         vol_01 = load_CT_volume(ct_path)   # (H, W, D) in [0, 1]
 
@@ -446,20 +485,22 @@ def main() -> None:
     if device_type != "cuda":
         args.amp = False        # GradScaler only works on CUDA
 
-    print(f"[train_3dvae] device={device}  amp={args.amp}")
+    print(f"[train_3dvae] device={device}  amp={args.amp}  use_nifti={args.use_nifti}")
 
     # ------------------------------------------------------------------
-    # Data discovery  (exact same pattern as train_klvae.py)
+    # Data discovery  (HDF5 or NIfTI per subject folder)
     # ------------------------------------------------------------------
-    all_ct_dirs = get_ct_dir_list(args.train_data_dir)
+    all_ct_dirs = get_ct_dir_list(args.train_data_dir, args.use_nifti)
     if len(all_ct_dirs) == 0:
-        raise RuntimeError(f"No ct.h5 files found under {args.train_data_dir}")
+        hint = "ct.nii.gz or ct.nii" if args.use_nifti else "ct.h5"
+        raise RuntimeError(f"No subject folders with {hint} found under {args.train_data_dir}")
 
     if args.val_data_dir is not None:
         train_ct_dirs = all_ct_dirs
-        val_ct_dirs = get_ct_dir_list(args.val_data_dir)
+        val_ct_dirs = get_ct_dir_list(args.val_data_dir, args.use_nifti)
         if len(val_ct_dirs) == 0:
-            raise RuntimeError(f"No ct.h5 files found under {args.val_data_dir}")
+            hint = "ct.nii.gz or ct.nii" if args.use_nifti else "ct.h5"
+            raise RuntimeError(f"No subject folders with {hint} found under {args.val_data_dir}")
     else:
         rng = np.random.default_rng(args.seed)
         perm = rng.permutation(len(all_ct_dirs)).tolist()
@@ -479,10 +520,12 @@ def main() -> None:
     dataset_train = CT3DDataset(
         train_ct_dirs, patch_size=patch_size,
         is_train=True, random_aug=args.random_aug,
+        use_nifti=args.use_nifti,
     )
     dataset_val = CT3DDataset(
         val_ct_dirs, patch_size=val_patch_size,
         is_train=False, random_aug=False,
+        use_nifti=args.use_nifti,
     )
 
     nw = args.dataloader_num_workers

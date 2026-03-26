@@ -84,9 +84,20 @@ python src/train_3dvae.py \
     --patch_size 64 64 64 \
     --num_epochs 100 \
     --amp
+
+# 3D VAE from NIfTI volumes (ct.nii.gz or ct.nii per subject folder)
+python src/train_3dvae.py \
+    --train_data_dir /data/AbdomenAtlasPro \
+    --use-nifti \
+    --patch_size 64 64 64 \
+    --num_epochs 100 \
+    --amp
 ```
 
-**Data format:** `train_data_dir/<subject_id>/ct.h5` -- HDF5 with key `"image"`, shape `(H, W, D)`, HU values in `[-1000, 1000]`.
+**Data format:**
+
+- **HDF5 (default):** `train_data_dir/<subject_id>/ct.h5` — key `"image"`, shape `(H, W, D)`, HU in `[-1000, 1000]`.
+- **NIfTI (`--use-nifti`):** `train_data_dir/<subject_id>/ct.nii.gz` or `ct.nii` — same HU range and shape convention `(H, W, D)`; requires [nibabel](https://nipy.org/nibabel/).
 
 ## Benchmark
 
@@ -120,7 +131,9 @@ OpenVAE/
 │   ├── train_3dvae.py            # 3D VAE training (MONAI MAISI)
 │   ├── demo_medvae.py            # 2D inference demo
 │   ├── utils_loss.py             # Segmentation + GAN loss utilities
-│   └── utils_discriminator.py    # PatchGAN / StyleGAN discriminators
+│   ├── utils_discriminator.py    # PatchGAN / StyleGAN discriminators
+│   ├── MIRA2D/                   # 2D SR / enhancement reference code
+│   └── MIRA3D/                   # 3D SR (MONAI)
 ├── test/
 │   ├── benchmark_vae.py          # Full benchmark (inference + metrics)
 │   ├── direct_compute_metrics.py # Metrics-only recomputation
