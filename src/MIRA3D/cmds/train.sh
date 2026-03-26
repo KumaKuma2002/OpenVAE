@@ -28,26 +28,35 @@ SEG_CKPT_NAME="checkpoint_final.pth"        # nnUNet checkpoint filename
 SEG_JSON="/projects/bodymaps/jliu452/ePAI/wli131_2024_1115/nnUNetTrainer__nnUNetPlans__3d_fullres/dataset.json"                                # /path/to/dataset.json (auto-found from model folder if empty)
 
 # Optional: resume a previous UNet training run
-RESUME_UNET="/projects/bodymaps/jliu452/MIRA3D/NV-Generate-CT/models/diff_unet_3d_ddpm-ct.pt"                             # /path/to/unet_latest.pt
+RESUME_UNET="/projects/bodymaps/jliu452/MIRA3D/outputs/mira3d/models/unet_best.pt"                             # /path/to/unet_latest.pt
 
 VAL_LR_NIFTI="/projects/bodymaps/jliu452/Data/Dataset804_SMILE-SR_Validation/baichaoxiao20240416_arterial_LR/ct.nii.gz"
 VAL_GT_NIFTI="/projects/bodymaps/jliu452/Data/Dataset901_SMILE/PT_data/baichaoxiao20240416_arterial.nii.gz"
 
 
 # ----------- training hyper-parameters -------------------------------------
-PATCH_SIZE="128 128 128"
+PATCH_SIZE="256 256 128"
 BATCH_SIZE=4
 GRAD_ACCUM=4                              # effective batch = BATCH_SIZE * GRAD_ACCUM
 LR=1e-4
 EPOCHS=100000
 WORKERS=4
 VAL_DDIM_STEPS=200                        # DDIM denoising steps during validation
+VAL_OVERLAP_RATIO=0.625                   # sliding-window overlap (higher = smoother patch boundaries)
 
 # Staged loss warmup (by global step)
-WARMUP_DIFF=2000
-WARMUP_UC=5000
-WARMUP_SEG_HU=15000
-WARMUP_CYCLE=50000
+# Set a stage's step to 0 to enable it from the very start.
+# Set it higher than EPOCHS*batches_per_epoch to effectively disable it.
+WARMUP_DIFF=0
+WARMUP_UC=0
+WARMUP_SEG_HU=0
+
+# ----------- loss weights --------------------------------------------------
+# diffusion loss weight is implicitly 1.0 (always the primary signal)
+PIXEL_LOSS_WEIGHT=0.1     # full-patch image-space L1 (recon vs HR, Stage 2+)
+UC_LOSS_WEIGHT=1e-3       # unchanged-region MSE (Stage 2+)
+SEG_LOSS_WEIGHT=1e-3      # segmentation cross-entropy (Stage 3+)
+HU_LOSS_WEIGHT=1e-4       # organ HU MSE (Stage 3+)
 
 # ----------- build command -------------------------------------------------
 CMD="python train_mira3d.py \
@@ -63,8 +72,12 @@ CMD="python train_mira3d.py \
     --warmup_diffusion_only_steps ${WARMUP_DIFF} \
     --warmup_add_unchanged_steps ${WARMUP_UC} \
     --warmup_add_seg_hu_steps ${WARMUP_SEG_HU} \
-    --warmup_add_cycle_steps ${WARMUP_CYCLE} \
     --val_ddim_steps ${VAL_DDIM_STEPS} \
+    --val_overlap_ratio ${VAL_OVERLAP_RATIO} \
+    --pixel_loss_weight ${PIXEL_LOSS_WEIGHT} \
+    --uc_loss_weight ${UC_LOSS_WEIGHT} \
+    --seg_loss_weight ${SEG_LOSS_WEIGHT} \
+    --hu_loss_weight ${HU_LOSS_WEIGHT} \
     --amp"
 
 if [ -n "${SEG_MODEL_PATH}" ]; then
@@ -81,10 +94,47 @@ fi
 
 if [ -n "${VAL_LR_NIFTI}" ] || [ -n "${VAL_GT_NIFTI}" ]; then
     CMD="${CMD} --val_lr_nifti_paths ${VAL_LR_NIFTI} --val_gt_nifti_paths ${VAL_GT_NIFTI}"
-elif [ -n "${VAL_NIFTI}" ]; then
+elif [ -n "${VAL_NIFTI:-}" ]; then
     CMD="${CMD} --val_nifti_paths ${VAL_NIFTI}"
 fi
 
 cd "$(dirname "$0")/.."
-echo "[mira3d] Running: ${CMD}"
+
+echo "[mira3d] ========== launch =========="
+echo "[mira3d] TRAIN_DATA_DIR: ${TRAIN_DATA_DIR}"
+echo "[mira3d] VAE_CKPT: ${VAE_CKPT}"
+echo "[mira3d] OUTPUT_DIR: ${OUTPUT_DIR}"
+echo "[mira3d] PATCH_SIZE: ${PATCH_SIZE}"
+echo "[mira3d] TRAIN_BATCH_SIZE: ${BATCH_SIZE}"
+echo "[mira3d] GRADIENT_ACCUMULATION_STEPS: ${GRAD_ACCUM}"
+echo "[mira3d] LEARNING_RATE: ${LR}"
+echo "[mira3d] EPOCHS: ${EPOCHS}"
+echo "[mira3d] DATALOADER_NUM_WORKERS: ${WORKERS}"
+echo "[mira3d] WARMUP_DIFFUSION_ONLY_STEPS: ${WARMUP_DIFF}"
+echo "[mira3d] WARMUP_ADD_UNCHANGED_STEPS: ${WARMUP_UC}"
+echo "[mira3d] WARMUP_ADD_SEG_HU_STEPS: ${WARMUP_SEG_HU}"
+echo "[mira3d] VAL_DDIM_STEPS: ${VAL_DDIM_STEPS}"
+echo "[mira3d] VAL_OVERLAP_RATIO: ${VAL_OVERLAP_RATIO}"
+echo "[mira3d] PIXEL_LOSS_WEIGHT: ${PIXEL_LOSS_WEIGHT}"
+echo "[mira3d] UC_LOSS_WEIGHT: ${UC_LOSS_WEIGHT}"
+echo "[mira3d] SEG_LOSS_WEIGHT: ${SEG_LOSS_WEIGHT}"
+echo "[mira3d] HU_LOSS_WEIGHT: ${HU_LOSS_WEIGHT}"
+echo "[mira3d] AMP: enabled"
+if [ -n "${SEG_MODEL_PATH}" ]; then
+    echo "[mira3d] SEG_MODEL_PATH: ${SEG_MODEL_PATH}"
+    echo "[mira3d] SEG_CHECKPOINT_NAME: ${SEG_CKPT_NAME}"
+    [ -n "${SEG_JSON}" ] && echo "[mira3d] SEG_DATASET_JSON: ${SEG_JSON}"
+fi
+if [ -n "${RESUME_UNET}" ]; then
+    echo "[mira3d] RESUME_UNET: ${RESUME_UNET}"
+fi
+if [ -n "${VAL_LR_NIFTI}" ] || [ -n "${VAL_GT_NIFTI}" ]; then
+    echo "[mira3d] VAL_LR_NIFTI: ${VAL_LR_NIFTI}"
+    echo "[mira3d] VAL_GT_NIFTI: ${VAL_GT_NIFTI}"
+elif [ -n "${VAL_NIFTI:-}" ]; then
+    echo "[mira3d] VAL_NIFTI: ${VAL_NIFTI:-}"
+fi
+echo "[mira3d] ============================="
+echo "[mira3d] Starting train_mira3d.py ..."
+
 eval ${CMD}

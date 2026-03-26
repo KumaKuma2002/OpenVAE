@@ -157,13 +157,17 @@ def random_augment_pair(hr: np.ndarray, lr: np.ndarray,
             if seg is not None:
                 seg = np.flip(seg, axis=axis).copy()
 
-    k = random.randint(0, 3)
-    if k > 0:
-        axes = random.choice([(0, 1), (0, 2), (1, 2)])
-        hr = np.rot90(hr, k=k, axes=axes).copy()
-        lr = np.rot90(lr, k=k, axes=axes).copy()
-        if seg is not None:
-            seg = np.rot90(seg, k=k, axes=axes).copy()
+    shape = hr.shape[:3]
+    safe_axes = [pair for pair in [(0, 1), (0, 2), (1, 2)]
+                 if shape[pair[0]] == shape[pair[1]]]
+    if safe_axes:
+        k = random.randint(0, 3)
+        if k > 0:
+            axes = random.choice(safe_axes)
+            hr = np.rot90(hr, k=k, axes=axes).copy()
+            lr = np.rot90(lr, k=k, axes=axes).copy()
+            if seg is not None:
+                seg = np.rot90(seg, k=k, axes=axes).copy()
 
     if seg is not None:
         return hr, lr, seg

@@ -145,13 +145,13 @@ def parse_args() -> argparse.Namespace:
                    help="Stage 2: + unchanged-region MSE.")
     p.add_argument("--warmup_add_seg_hu_steps", type=int, default=15000,
                    help="Stage 3: + seg CE + HU organ MSE.")
-    p.add_argument("--warmup_add_cycle_steps", type=int, default=50000,
-                   help="Stage 4: + cycle consistency (future).")
-
     # --- Loss weights ---
     p.add_argument("--uc_loss_weight", type=float, default=1e-3)
     p.add_argument("--seg_loss_weight", type=float, default=1e-3)
     p.add_argument("--hu_loss_weight", type=float, default=1e-4)
+    p.add_argument("--pixel_loss_weight", type=float, default=0.1,
+                   help="Weight for full-patch image-space L1 loss (recon vs HR). "
+                        "Activates together with --warmup_add_unchanged_steps.")
 
     # --- AMP ---
     p.add_argument("--amp", action="store_true")
@@ -164,7 +164,7 @@ def parse_args() -> argparse.Namespace:
                    help="Number of val samples to visualise on wandb.")
     p.add_argument("--val_ddim_steps", type=int, default=50,
                    help="Number of DDIM denoising steps during validation.")
-    p.add_argument("--val_overlap_ratio", type=float, default=0.5,
+    p.add_argument("--val_overlap_ratio", type=float, default=0.625,
                    help="Overlap ratio for sliding-window SR during validation.")
     p.add_argument("--wandb_project", type=str, default="mira3d")
     p.add_argument("--wandb_run_name", type=str, default=None)
@@ -517,7 +517,7 @@ def _sliding_window_sr(
     pad_h = max(ph - H, 0)
     pad_w = max(pw - W, 0)
     pad_d = max(pd - D, 0)
-    vol_padded = np.pad(vol_01, ((0, pad_h), (0, pad_w), (0, pad_d)), mode="constant")
+    vol_padded = np.pad(vol_01, ((0, pad_h), (0, pad_w), (0, pad_d)), mode="reflect")
     Hp, Wp, Dp = vol_padded.shape
 
     sh, sw, sd = max(ph - oh, 1), max(pw - ow, 1), max(pd - od, 1)
@@ -546,7 +546,9 @@ def _sliding_window_sr(
                 with torch.autocast(device_type=device.type, enabled=amp):
                     z_lr = vae_encode_latent(vae, lr_t)
 
-                z = torch.randn_like(z_lr)
+                patch_seed = int(hs * 1_000_000 + ws * 1_000 + ds) % (2 ** 31)
+                patch_rng = torch.Generator(device=device).manual_seed(patch_seed)
+                z = torch.randn(z_lr.shape, generator=patch_rng, device=device, dtype=z_lr.dtype)
                 for t_val in ddim_scheduler.timesteps:
                     t = torch.full((1,), t_val, device=device, dtype=torch.long)
                     unet_in = torch.cat([z, z_lr], dim=1)
@@ -726,6 +728,7 @@ def train_one_step(
         aux_uc = torch.tensor(0.0, device=device)
         aux_seg = torch.tensor(0.0, device=device)
         aux_hu = torch.tensor(0.0, device=device)
+        aux_pixel = torch.tensor(0.0, device=device)
 
         # Decode to image space when aux losses are active
         need_decode = (
@@ -740,10 +743,13 @@ def train_one_step(
             recon_hu = recon_hr * 2000.0 - 1000.0
             hr_hu = hr * 2000.0 - 1000.0
 
-            # Stage 2: unchanged-region loss
+            # Stage 2: pixel-level L1 + unchanged-region loss
             if global_step >= args.warmup_add_unchanged_steps:
+                aux_pixel = F.l1_loss(recon_hr.float(), hr.float())
                 aux_uc = unchanged_region_loss(recon_hu, hr_hu)
-                loss = loss + args.uc_loss_weight * aux_uc
+                loss = (loss
+                        + args.pixel_loss_weight * aux_pixel
+                        + args.uc_loss_weight * aux_uc)
 
             # Stage 3: segmentation + organ HU loss
             if (segmenter is not None
@@ -762,6 +768,7 @@ def train_one_step(
     return {
         "loss": loss,
         "diff": diff_loss.detach(),
+        "pixel": aux_pixel.detach(),
         "uc": aux_uc.detach(),
         "seg": aux_seg.detach(),
         "hu": aux_hu.detach(),
@@ -902,7 +909,7 @@ def main() -> None:
         t0 = time.time()
         unet.train()
 
-        acc = {"diff": 0.0, "uc": 0.0, "seg": 0.0, "hu": 0.0, "total": 0.0}
+        acc = {"diff": 0.0, "pixel": 0.0, "uc": 0.0, "seg": 0.0, "hu": 0.0, "total": 0.0}
         n_batches = 0
 
         for micro_idx, batch in enumerate(
@@ -920,7 +927,7 @@ def main() -> None:
 
             if not logged_shapes:
                 hr = batch["hr"]
-                with torch.no_grad():
+                with torch.no_grad(), torch.autocast(device_type=device_type, enabled=args.amp):
                     z_sample = vae_encode_latent(vae, hr[:1].to(device))
                 print(f"[mira3d] SHAPE DIAGNOSTIC:  "
                       f"hr={tuple(hr.shape)}  z={tuple(z_sample.shape)}  "
@@ -944,6 +951,7 @@ def main() -> None:
                     optimizer.zero_grad(set_to_none=True)
 
             acc["diff"] += out["diff"].item()
+            acc["pixel"] += out["pixel"].item()
             acc["uc"] += out["uc"].item()
             acc["seg"] += out["seg"].item()
             acc["hu"] += out["hu"].item()
@@ -954,7 +962,7 @@ def main() -> None:
 
             if global_step % args.log_steps == 0 and is_accum_boundary:
                 wandb.log(
-                    {f"train/{k}_loss": out[k].item() for k in ("diff", "uc", "seg", "hu")}
+                    {f"train/{k}_loss": out[k].item() for k in ("diff", "pixel", "uc", "seg", "hu")}
                     | {"train/total_loss": out["loss"].item()},
                     step=global_step,
                 )
@@ -966,7 +974,8 @@ def main() -> None:
         print(
             f"[mira3d] epoch={epoch:04d}  "
             f"total={acc['total']:.5f}  diff={acc['diff']:.5f}  "
-            f"uc={acc['uc']:.5f}  seg={acc['seg']:.5f}  hu={acc['hu']:.5f}  "
+            f"pixel={acc['pixel']:.5f}  uc={acc['uc']:.5f}  "
+            f"seg={acc['seg']:.5f}  hu={acc['hu']:.5f}  "
             f"step={global_step}  time={dt:.0f}s"
         )
         wandb.log({"train/epoch_total": acc["total"]}, step=global_step)
