@@ -37,10 +37,10 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.amp import GradScaler
 from torch.utils.data import DataLoader
 import wandb
 from tqdm import tqdm
+from accelerate import Accelerator
 
 from monai.apps.generation.maisi.networks.autoencoderkl_maisi import AutoencoderKlMaisi
 from monai.networks.nets.diffusion_model_unet import DiffusionModelUNet
@@ -612,6 +612,7 @@ def validate(
     os.makedirs(val_dir, exist_ok=True)
 
     ssim_list, psnr_list = [], []
+    mae100_list, mae_hu_list, bias_hu_list, std_ratio_list = [], [], [], []
     wandb_log: dict = {}
 
     for idx, (lr_path, gt_path) in enumerate(pairs):
@@ -647,7 +648,22 @@ def validate(
             psnr_val = peak_signal_noise_ratio(gt_vol, sr_vol, data_range=1.0)
             ssim_list.append(ssim_val)
             psnr_list.append(psnr_val)
-            print(f"[mira3d]     ssim={ssim_val:.4f}  psnr={psnr_val:.2f}")
+
+            sr_hu_v = sr_vol * 2000.0 - 1000.0
+            gt_hu_v = gt_vol * 2000.0 - 1000.0
+            mae_hu_val = float(np.mean(np.abs(sr_hu_v - gt_hu_v)))
+            mae100_val = max(0.0, 100.0 * (1.0 - mae_hu_val / 2000.0))
+            bias_hu_val = float(np.mean(sr_hu_v - gt_hu_v))
+            std_ratio_val = float(np.std(sr_hu_v) / (np.std(gt_hu_v) + 1e-8))
+            mae100_list.append(mae100_val)
+            mae_hu_list.append(mae_hu_val)
+            bias_hu_list.append(bias_hu_val)
+            std_ratio_list.append(std_ratio_val)
+            print(
+                f"[mira3d]     ssim={ssim_val:.4f}  psnr={psnr_val:.2f}  "
+                f"mae100={mae100_val:.2f}  mae_hu={mae_hu_val:.1f}  "
+                f"bias_hu={bias_hu_val:+.1f}  std_ratio={std_ratio_val:.3f}"
+            )
 
         # ---- wandb images: full orthogonal mid-slices ----
         H, W, D = sr_vol.shape
@@ -673,15 +689,26 @@ def validate(
 
     mean_ssim = float(np.mean(ssim_list)) if ssim_list else 0.0
     mean_psnr = float(np.mean(psnr_list)) if psnr_list else 0.0
+    mean_mae100 = float(np.mean(mae100_list)) if mae100_list else 0.0
+    mean_mae_hu = float(np.mean(mae_hu_list)) if mae_hu_list else 0.0
+    mean_bias_hu = float(np.mean(bias_hu_list)) if bias_hu_list else 0.0
+    mean_std_ratio = float(np.mean(std_ratio_list)) if std_ratio_list else 0.0
+
     wandb_log["ssim mean"] = mean_ssim
     wandb_log["psnr mean"] = mean_psnr
+    wandb_log["mae100 mean"] = mean_mae100
+    wandb_log["mae_hu mean"] = mean_mae_hu
+    wandb_log["bias_hu mean"] = mean_bias_hu
+    wandb_log["std_ratio mean"] = mean_std_ratio
     wandb.log(wandb_log, step=epoch)
 
     print(
         f"[mira3d]   val epoch={epoch:04d}  "
-        f"ssim={mean_ssim:.4f}  psnr={mean_psnr:.2f}"
+        f"ssim={mean_ssim:.4f}  psnr={mean_psnr:.2f}  "
+        f"mae100={mean_mae100:.2f}  mae_hu={mean_mae_hu:.1f}  "
+        f"bias_hu={mean_bias_hu:+.1f}  std_ratio={mean_std_ratio:.3f}"
     )
-    return mean_ssim, mean_psnr
+    return mean_ssim, mean_psnr, mean_mae100
 
 
 # ===================================================================
@@ -738,15 +765,18 @@ def train_one_step(
         )
         if need_decode:
             z_pred = predict_x0_from_noise(z_noisy, noise_pred, t, alphas_cumprod)
-            with torch.no_grad():
-                recon_hr = vae.decode(z_pred)
+            # VAE weights are frozen (requires_grad=False in build_vae); removing
+            # no_grad here lets pixel/UC/HU gradients flow back through the frozen
+            # decode graph to noise_pred → UNet.
+            recon_hr = vae.decode(z_pred)
             recon_hu = recon_hr * 2000.0 - 1000.0
             hr_hu = hr * 2000.0 - 1000.0
 
             # Stage 2: pixel-level L1 + unchanged-region loss
             if global_step >= args.warmup_add_unchanged_steps:
                 aux_pixel = F.l1_loss(recon_hr.float(), hr.float())
-                aux_uc = unchanged_region_loss(recon_hu, hr_hu)
+                # UC is now MSE in [0,1] space — same scale as pixel L1
+                aux_uc = unchanged_region_loss(recon_hr, hr)
                 loss = (loss
                         + args.pixel_loss_weight * aux_pixel
                         + args.uc_loss_weight * aux_uc)
@@ -781,19 +811,34 @@ def train_one_step(
 
 def main() -> None:
     args = parse_args()
-    seed_everything(args.seed)
 
-    os.makedirs(args.output_dir, exist_ok=True)
-    model_dir = os.path.join(args.output_dir, "models")
-    os.makedirs(model_dir, exist_ok=True)
-    wandb.init(project=args.wandb_project, name=args.wandb_run_name,
-               config=vars(args), dir=args.output_dir)
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # ---- accelerator (handles DDP, AMP, gradient accumulation) -------
+    # mixed_precision="fp16" enables automatic GradScaler + autocast.
+    # gradient_accumulation_steps tells accumulate() when to sync grads.
+    accelerator = Accelerator(
+        mixed_precision="fp16" if args.amp else "no",
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+    )
+    device = accelerator.device
     device_type = device.type
     if device_type != "cuda":
         args.amp = False
-    print(f"[mira3d] device={device}  amp={args.amp}")
+
+    # Different random seed per rank for data diversity
+    seed_everything(args.seed + accelerator.process_index)
+
+    # ---- output dirs + wandb (main process only) ---------------------
+    model_dir = os.path.join(args.output_dir, "models")
+    if accelerator.is_main_process:
+        os.makedirs(args.output_dir, exist_ok=True)
+        os.makedirs(model_dir, exist_ok=True)
+        wandb.init(project=args.wandb_project, name=args.wandb_run_name,
+                   config=vars(args), dir=args.output_dir)
+    accelerator.wait_for_everyone()
+
+    if accelerator.is_main_process:
+        print(f"[mira3d] device={device}  amp={args.amp}  "
+              f"num_processes={accelerator.num_processes}")
 
     # ---- data --------------------------------------------------------
     all_dirs = get_ct_dir_list(args.train_data_dir)
@@ -850,7 +895,8 @@ def main() -> None:
     else:
         n_val_str = "none (set --val_nifti_paths or --val_lr/gt_nifti_paths for full-volume val)"
 
-    print(f"[mira3d] train={len(train_dirs)} dirs  val={n_val_str}  patch={patch_size}")
+    if accelerator.is_main_process:
+        print(f"[mira3d] train={len(train_dirs)} dirs  val={n_val_str}  patch={patch_size}")
 
     # ---- models ------------------------------------------------------
     vae = build_vae(args, device)
@@ -864,11 +910,13 @@ def main() -> None:
         organ_penalties_by_id = build_organ_penalties(name_to_id)
         if args.seg_num_classes is None:
             args.seg_num_classes = len(name_to_id)
-        print(f"[mira3d] Label map: {len(name_to_id)} labels, "
-              f"{len(organ_penalties_by_id)} penalised organs")
+        if accelerator.is_main_process:
+            print(f"[mira3d] Label map: {len(name_to_id)} labels, "
+                  f"{len(organ_penalties_by_id)} penalised organs")
     elif segmenter is not None:
-        print("[mira3d] WARNING: segmenter loaded but no --seg_dataset_json; "
-              "HU loss will use uniform weight=1.0")
+        if accelerator.is_main_process:
+            print("[mira3d] WARNING: segmenter loaded but no --seg_dataset_json; "
+                  "HU loss will use uniform weight=1.0")
     if args.seg_num_classes is None:
         args.seg_num_classes = 8
 
@@ -881,29 +929,34 @@ def main() -> None:
 
     # ---- optimiser ---------------------------------------------------
     optimizer = torch.optim.Adam(unet.parameters(), lr=args.learning_rate)
-    scaler = (GradScaler(device="cuda", init_scale=2.**8, growth_factor=1.5)
-              if args.amp else None)
-
     diff_loss_fn = nn.MSELoss() if args.diffusion_loss == "l2" else nn.L1Loss()
 
-    # ---- dump config -------------------------------------------------
-    with open(os.path.join(args.output_dir, "train_config.json"), "w") as f:
-        json.dump(vars(args), f, indent=2, default=str)
+    # ---- prepare for distributed training ----------------------------
+    # accelerate wraps unet in DDP, patches optimizer with GradScaler when
+    # mixed_precision="fp16", and adds DistributedSampler to the dataloader.
+    unet, optimizer, train_dl = accelerator.prepare(unet, optimizer, train_dl)
 
-    n_unet = sum(p.numel() for p in unet.parameters()) / 1e6
-    n_vae = sum(p.numel() for p in vae.parameters()) / 1e6
-    accum = args.gradient_accumulation_steps
-    eff_bs = args.train_batch_size * accum
-    print(f"[mira3d] UNet: {n_unet:.1f}M | VAE: {n_vae:.1f}M (frozen)")
-    print(f"[mira3d] Batches/epoch: {len(train_dl)}  "
-          f"batch={args.train_batch_size} x accum={accum} = eff_batch={eff_bs}")
-    print(f"[mira3d] patch_size={patch_size}  amp={args.amp}")
+    # ---- dump config (main process only) -----------------------------
+    if accelerator.is_main_process:
+        with open(os.path.join(args.output_dir, "train_config.json"), "w") as f:
+            json.dump(vars(args), f, indent=2, default=str)
+
+        n_unet = sum(p.numel() for p in accelerator.unwrap_model(unet).parameters()) / 1e6
+        n_vae = sum(p.numel() for p in vae.parameters()) / 1e6
+        accum = args.gradient_accumulation_steps
+        eff_bs = args.train_batch_size * accum * accelerator.num_processes
+        print(f"[mira3d] UNet: {n_unet:.1f}M | VAE: {n_vae:.1f}M (frozen)")
+        print(f"[mira3d] Batches/epoch: {len(train_dl)}  "
+              f"batch={args.train_batch_size} x accum={accum} "
+              f"x {accelerator.num_processes} GPUs = eff_batch={eff_bs}")
+        print(f"[mira3d] patch_size={patch_size}  amp={args.amp}")
+        print("[mira3d] Starting training...")
 
     # ---- training loop -----------------------------------------------
     global_step = 0
     best_ssim = 0.0
+    best_mae100 = 0.0
     logged_shapes = False
-    print("[mira3d] Starting training...")
 
     for epoch in range(args.num_epochs):
         t0 = time.time()
@@ -913,42 +966,36 @@ def main() -> None:
         n_batches = 0
 
         for micro_idx, batch in enumerate(
-            tqdm(train_dl, desc=f"Epoch {epoch:04d}", dynamic_ncols=True)
+            tqdm(train_dl, desc=f"Epoch {epoch:04d}", dynamic_ncols=True,
+                 disable=not accelerator.is_main_process)
         ):
-            is_accum_boundary = ((micro_idx + 1) % accum == 0) or (micro_idx + 1 == len(train_dl))
+            with accelerator.accumulate(unet):
+                # accelerator.accumulate() skips DDP gradient sync on
+                # non-boundary steps, and accelerator.backward() handles
+                # GradScaler scaling when mixed_precision="fp16".
+                out = train_one_step(
+                    batch, unet, vae, scheduler, diff_loss_fn,
+                    alphas_cumprod, segmenter, seg_preprocess,
+                    organ_penalties_by_id,
+                    args, global_step, device, device_type,
+                )
+                accelerator.backward(out["loss"])
+                if accelerator.sync_gradients:
+                    accelerator.clip_grad_norm_(unet.parameters(), args.max_grad_norm)
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
 
-            out = train_one_step(
-                batch, unet, vae, scheduler, diff_loss_fn,
-                alphas_cumprod, segmenter, seg_preprocess,
-                organ_penalties_by_id,
-                args, global_step, device, device_type,
-            )
-            loss = out["loss"] / accum
-
+            # Shape diagnostic once, main process only
             if not logged_shapes:
-                hr = batch["hr"]
-                with torch.no_grad(), torch.autocast(device_type=device_type, enabled=args.amp):
-                    z_sample = vae_encode_latent(vae, hr[:1].to(device))
-                print(f"[mira3d] SHAPE DIAGNOSTIC:  "
-                      f"hr={tuple(hr.shape)}  z={tuple(z_sample.shape)}  "
-                      f"unet_in=({z_sample.shape[0]},{z_sample.shape[1]*2},*{z_sample.shape[2:]})  "
-                      f"GPU mem={torch.cuda.max_memory_allocated()/1e9:.1f} GB")
+                if accelerator.is_main_process:
+                    hr = batch["hr"]
+                    with torch.no_grad(), torch.autocast(device_type=device_type, enabled=args.amp):
+                        z_sample = vae_encode_latent(vae, hr[:1].to(device))
+                    print(f"[mira3d] SHAPE DIAGNOSTIC:  "
+                          f"hr={tuple(hr.shape)}  z={tuple(z_sample.shape)}  "
+                          f"unet_in=({z_sample.shape[0]},{z_sample.shape[1]*2},*{z_sample.shape[2:]})  "
+                          f"GPU mem={torch.cuda.max_memory_allocated()/1e9:.1f} GB")
                 logged_shapes = True
-
-            if args.amp:
-                scaler.scale(loss).backward()
-                if is_accum_boundary:
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(unet.parameters(), args.max_grad_norm)
-                    scaler.step(optimizer)
-                    scaler.update()
-                    optimizer.zero_grad(set_to_none=True)
-            else:
-                loss.backward()
-                if is_accum_boundary:
-                    torch.nn.utils.clip_grad_norm_(unet.parameters(), args.max_grad_norm)
-                    optimizer.step()
-                    optimizer.zero_grad(set_to_none=True)
 
             acc["diff"] += out["diff"].item()
             acc["pixel"] += out["pixel"].item()
@@ -957,55 +1004,72 @@ def main() -> None:
             acc["hu"] += out["hu"].item()
             acc["total"] += out["loss"].item()
             n_batches += 1
-            if is_accum_boundary:
+
+            if accelerator.sync_gradients:
                 global_step += 1
+                if global_step % args.log_steps == 0 and accelerator.is_main_process:
+                    wandb.log(
+                        {f"train/{k}_loss": out[k].item() for k in ("diff", "pixel", "uc", "seg", "hu")}
+                        | {"train/total_loss": out["loss"].item()},
+                        step=global_step,
+                    )
 
-            if global_step % args.log_steps == 0 and is_accum_boundary:
-                wandb.log(
-                    {f"train/{k}_loss": out[k].item() for k in ("diff", "pixel", "uc", "seg", "hu")}
-                    | {"train/total_loss": out["loss"].item()},
-                    step=global_step,
-                )
+        # ---- epoch summary (main process only) -----------------------
+        if accelerator.is_main_process:
+            for k in acc:
+                acc[k] /= max(n_batches, 1)
+            dt = time.time() - t0
+            print(
+                f"[mira3d] epoch={epoch:04d}  "
+                f"total={acc['total']:.5f}  diff={acc['diff']:.5f}  "
+                f"pixel={acc['pixel']:.5f}  uc={acc['uc']:.5f}  "
+                f"seg={acc['seg']:.5f}  hu={acc['hu']:.5f}  "
+                f"step={global_step}  time={dt:.0f}s"
+            )
+            wandb.log({"train/epoch_total": acc["total"]}, step=global_step)
 
-        # ---- epoch summary -------------------------------------------
-        for k in acc:
-            acc[k] /= max(n_batches, 1)
-        dt = time.time() - t0
-        print(
-            f"[mira3d] epoch={epoch:04d}  "
-            f"total={acc['total']:.5f}  diff={acc['diff']:.5f}  "
-            f"pixel={acc['pixel']:.5f}  uc={acc['uc']:.5f}  "
-            f"seg={acc['seg']:.5f}  hu={acc['hu']:.5f}  "
-            f"step={global_step}  time={dt:.0f}s"
-        )
-        wandb.log({"train/epoch_total": acc["total"]}, step=global_step)
-
-        # ---- validation (full-volume sliding-window SR) ----------------
+        # ---- validation (main process only, with sync barriers) ------
         do_val = (epoch % args.val_interval == 0) or (epoch == args.num_epochs - 1)
         has_nifti_val = args.val_nifti_paths or (args.val_lr_nifti_paths and args.val_gt_nifti_paths)
         if do_val and has_nifti_val:
-            mean_ssim, mean_psnr = validate(
-                epoch, unet, vae, args, device, args.output_dir,
-            )
-            if mean_ssim > best_ssim:
-                best_ssim = mean_ssim
-                torch.save(unet.state_dict(),
-                           os.path.join(model_dir, "unet_best.pt"))
-                with open(os.path.join(model_dir, "best_score_info.txt"), "w") as f:
-                    f.write(f"Best SSIM: {best_ssim:.6f}\n")
-                    f.write(f"Best PSNR: {mean_psnr:.4f}\n")
-                    f.write(f"Epoch: {epoch}\n")
-                print(f"[mira3d]   -> New best SSIM={best_ssim:.4f}  PSNR={mean_psnr:.2f}")
+            # Barrier: all ranks finish training before rank 0 starts val
+            accelerator.wait_for_everyone()
+            if accelerator.is_main_process:
+                raw_unet = accelerator.unwrap_model(unet)
+                mean_ssim, mean_psnr, mean_mae100 = validate(
+                    epoch, raw_unet, vae, args, device, args.output_dir,
+                )
+                if mean_ssim > best_ssim:
+                    best_ssim = mean_ssim
+                if mean_mae100 > best_mae100:
+                    best_mae100 = mean_mae100
+                    torch.save(raw_unet.state_dict(),
+                               os.path.join(model_dir, "unet_best.pt"))
+                    with open(os.path.join(model_dir, "best_score_info.txt"), "w") as f:
+                        f.write(f"Best MAE-100: {best_mae100:.4f}\n")
+                        f.write(f"Best SSIM: {mean_ssim:.6f}\n")
+                        f.write(f"Best PSNR: {mean_psnr:.4f}\n")
+                        f.write(f"Epoch: {epoch}\n")
+                    print(
+                        f"[mira3d]   -> New best MAE-100={best_mae100:.2f}  "
+                        f"SSIM={mean_ssim:.4f}  PSNR={mean_psnr:.2f}"
+                    )
+            # Barrier: non-main ranks wait for rank 0 to finish val
+            accelerator.wait_for_everyone()
 
-        # ---- checkpoints ---------------------------------------------
-        if args.save_interval > 0 and epoch % args.save_interval == 0:
-            torch.save(unet.state_dict(),
-                       os.path.join(model_dir, f"unet_epoch{epoch:04d}.pt"))
-        torch.save(unet.state_dict(),
-                   os.path.join(model_dir, "unet_latest.pt"))
+        # ---- checkpoints (main process only) -------------------------
+        if accelerator.is_main_process:
+            raw_unet = accelerator.unwrap_model(unet)
+            if args.save_interval > 0 and epoch % args.save_interval == 0:
+                torch.save(raw_unet.state_dict(),
+                           os.path.join(model_dir, f"unet_epoch{epoch:04d}.pt"))
+            torch.save(raw_unet.state_dict(),
+                       os.path.join(model_dir, "unet_latest.pt"))
 
-    wandb.finish()
-    print(f"[mira3d] Done. Best SSIM={best_ssim:.4f}  Checkpoints: {model_dir}")
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        wandb.finish()
+        print(f"[mira3d] Done. Best MAE-100={best_mae100:.2f}  Best SSIM={best_ssim:.4f}  Checkpoints: {model_dir}")
 
 
 if __name__ == "__main__":

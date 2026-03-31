@@ -4,6 +4,8 @@ Open-source VAE family for medical imaging. Pretrained latent backbones for CT/M
 
 2D and 3D autoencoders trained on up to 1M CT volumes with perceptual, adversarial, and segmentation-guided objectives.
 
+![OpenVAE Teaser](docs/OpenVAE.png)
+
 ## Models
 
 | Model | Type | Patients | Latent | Resolution |
@@ -13,8 +15,9 @@ Open-source VAE family for medical imaging. Pretrained latent backbones for CT/M
 | `OpenVAE-2D-4x-300K` | KL-VAE | 300K | 4ch, 4x downsample | 512x512 |
 | `OpenVAE-2D-4x-PCCT_Enhanced` | KL-VAE | 300K | 4ch, 4x downsample | 512x512 |
 | `OpenVAE-3D-4x-20K` | KL-VAE | 20K | 4ch, 4x downsample | 64^3 patch |
-| `OpenVAE-3D-4x-100K` | KL-VAE | 100K | 4ch, 4x downsample | 64^3 patch |
-| `OpenVAE-3D-4x-1M` | KL-VAE | 1M | 4ch, 4x downsample | 64^3 patch |
+| `OpenVAE-3D-4x-20K` | KL-VAE | 20K | 4ch, 4x downsample | 128^3 patch |
+| `OpenVAE-3D-4x-100K` | KL-VAE | 100K | 4ch, 4x downsample | 128^3 patch |
+| `OpenVAE-3D-4x-1M` | KL-VAE | 1M | 4ch, 4x downsample | 128^3 patch |
 | `OpenVAE-3D-4x-100K-VQ` | VQ-VAE | 100K | 4ch, 4x downsample | 64^3 patch |
 | `OpenVAE-3D-8x-100K-VQ` | VQ-VAE | 100K | 4ch, 8x downsample | 64^3 patch |
 

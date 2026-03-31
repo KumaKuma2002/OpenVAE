@@ -2,7 +2,7 @@
 Auxiliary loss functions for MIRA3D super-resolution LDM training.
 
 Ported from MIRA2D/utils_loss.py (2D) to 3D volumes.
-All image tensors are expected in HU domain [-1000, 1000] unless noted.
+Image tensors are in [0, 1] normalized space unless noted (HU = x*2000-1000).
 """
 
 from __future__ import annotations
@@ -80,22 +80,28 @@ def build_organ_penalties(
 
 
 # ---------------------------------------------------------------------------
-# Unchanged-region loss  (air / bone should stay unchanged after SR)
+# Unchanged-region loss  (air regions should stay unchanged after SR)
 # ---------------------------------------------------------------------------
 
 def unchanged_region_loss(
-    recon_hu: torch.Tensor,
-    original_hu: torch.Tensor,
+    recon_01: torch.Tensor,
+    hr_01: torch.Tensor,
     hu_threshold: float = 800.0,
 ) -> torch.Tensor:
     """
-    MSE on voxels that are clearly air (< -threshold) in both images.
-    Forces the model not to hallucinate content in air regions.
+    MSE in [0,1] space on voxels that are clearly air in the HR reference.
+
+    Air is defined as HU < -hu_threshold, derived from hr_01 internally.
+    recon_01 is clamped to [0,1] before computing so diff^2 is strictly
+    bounded in [0,1] and the loss scale matches pixel L1 (~O(0.001-0.05)).
+    Clamp is differentiable (grad=1 inside [0,1], 0 outside).
     """
-    air_mask = (original_hu < -hu_threshold).float()
+    hr_hu = hr_01 * 2000.0 - 1000.0
+    air_mask = (hr_hu < -hu_threshold).float()
     if air_mask.sum() < 1:
-        return torch.tensor(0.0, device=recon_hu.device)
-    diff = (recon_hu - original_hu) * air_mask
+        return torch.tensor(0.0, device=recon_01.device)
+    recon_clamped = recon_01.clamp(0.0, 1.0)
+    diff = (recon_clamped - hr_01) * air_mask
     return (diff ** 2).sum() / air_mask.sum().clamp(min=1)
 
 

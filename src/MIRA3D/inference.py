@@ -61,6 +61,8 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--amp", action="store_true")
     p.add_argument("--device", type=str, default=None)
+    p.add_argument("--seed", type=int, default=42,
+                   help="Global noise seed for coherent 3D latent noise.")
 
     return p.parse_args()
 
@@ -150,13 +152,18 @@ def build_unet(args, device):
 
 @torch.no_grad()
 def ddim_sample(
-    unet, scheduler, z_lr, latent_shape, device, amp,
+    unet, scheduler, z_lr, z_init, device, amp,
     num_inference_steps: int = 50,
 ):
-    """Full DDIM denoising from pure noise, conditioned on z_lr."""
-    scheduler.set_timesteps(num_inference_steps)
+    """
+    DDIM denoising conditioned on z_lr, starting from z_init.
 
-    z = torch.randn(latent_shape, device=device)
+    z_init is a pre-sliced region from the global coherent noise volume
+    so that overlapping regions across patches share the same initial noise,
+    reducing boundary discontinuities (same principle as MAISI full-volume generation).
+    """
+    scheduler.set_timesteps(num_inference_steps)
+    z = z_init.clone()
 
     for t_val in scheduler.timesteps:
         t = torch.full((z.shape[0],), t_val, device=device, dtype=torch.long)
@@ -180,6 +187,7 @@ def sliding_window_sr(
     patch_size: tuple, overlap_ratio: float,
     device: torch.device, amp: bool,
     num_inference_steps: int,
+    seed: int = 42,
 ) -> np.ndarray:
     H, W, D = vol_01.shape
     ph, pw, pd = patch_size
@@ -187,8 +195,9 @@ def sliding_window_sr(
     ow = int(pw * overlap_ratio)
     od = int(pd * overlap_ratio)
 
+    # Use reflect padding so border patches see real anatomy, not zeros.
     pad_h, pad_w, pad_d = max(ph - H, 0), max(pw - W, 0), max(pd - D, 0)
-    vol_padded = np.pad(vol_01, ((0, pad_h), (0, pad_w), (0, pad_d)), mode="constant")
+    vol_padded = np.pad(vol_01, ((0, pad_h), (0, pad_w), (0, pad_d)), mode="reflect")
     Hp, Wp, Dp = vol_padded.shape
 
     sh, sw, sd = max(ph - oh, 1), max(pw - ow, 1), max(pd - od, 1)
@@ -203,8 +212,22 @@ def sliding_window_sr(
     recon_sum = np.zeros_like(vol_padded, dtype=np.float64)
     weight_sum = np.zeros_like(vol_padded, dtype=np.float64)
 
+    # ------------------------------------------------------------------
+    # Global coherent noise volume (MAISI-style continuous latent space).
+    # Pre-generate one noise tensor covering the whole padded volume at
+    # latent resolution. Each patch slices its region from this shared
+    # tensor, so overlapping voxels start from the same noise values →
+    # no stochastic discontinuity at patch boundaries.
+    # VAE factor is detected automatically from the first patch encoding.
+    # ------------------------------------------------------------------
+    vae_factor: int | None = None
+    z_global: torch.Tensor | None = None
+    latent_channels: int | None = None
+
     total = len(starts_h) * len(starts_w) * len(starts_d)
     pbar = tqdm(total=total, desc="SR patches")
+
+    rng = torch.Generator(device=device).manual_seed(seed)
 
     for hs in starts_h:
         for ws in starts_w:
@@ -220,9 +243,33 @@ def sliding_window_sr(
                         enc_out = vae.encode(lr_t)
                         z_lr = enc_out[0] if isinstance(enc_out, (tuple, list)) else enc_out
 
-                    latent_shape = z_lr.shape
+                    # Detect VAE spatial downsampling factor from first patch.
+                    if vae_factor is None:
+                        vae_factor = ph // z_lr.shape[2]
+                        latent_channels = z_lr.shape[1]
+                        lHp = Hp // vae_factor
+                        lWp = Wp // vae_factor
+                        lDp = Dp // vae_factor
+                        z_global = torch.randn(
+                            (1, latent_channels, lHp, lWp, lDp),
+                            generator=rng, device=device, dtype=z_lr.dtype,
+                        )
+                        print(
+                            f"[mira3d-infer] VAE factor={vae_factor}  "
+                            f"latent volume={tuple(z_global.shape)}"
+                        )
+
+                    # Slice the coherent noise region for this patch.
+                    lhs = hs // vae_factor
+                    lws = ws // vae_factor
+                    lds = ds // vae_factor
+                    lph = z_lr.shape[2]
+                    lpw = z_lr.shape[3]
+                    lpd = z_lr.shape[4]
+                    z_init = z_global[:, :, lhs:lhs+lph, lws:lws+lpw, lds:lds+lpd]
+
                     z_sr = ddim_sample(
-                        unet, scheduler, z_lr, latent_shape, device, amp,
+                        unet, scheduler, z_lr, z_init, device, amp,
                         num_inference_steps,
                     )
 
@@ -274,6 +321,7 @@ def main() -> None:
         vol_01, vae, unet, scheduler,
         tuple(args.patch_size), args.overlap_ratio,
         device, args.amp, args.num_inference_steps,
+        seed=args.seed,
     )
     sr_hu = ct_01_to_hu(sr_01)
 
