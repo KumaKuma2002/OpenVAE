@@ -44,6 +44,7 @@ from accelerate import Accelerator
 
 from monai.apps.generation.maisi.networks.autoencoderkl_maisi import AutoencoderKlMaisi
 from monai.networks.nets.diffusion_model_unet import DiffusionModelUNet
+from utils_discriminator_3d import NLayerDiscriminator3D
 from monai.networks.schedulers.ddpm import DDPMScheduler
 from monai.networks.schedulers.ddim import DDIMScheduler as DDIMSchedulerMonai
 from skimage.metrics import structural_similarity, peak_signal_noise_ratio
@@ -152,6 +153,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--pixel_loss_weight", type=float, default=0.1,
                    help="Weight for full-patch image-space L1 loss (recon vs HR). "
                         "Activates together with --warmup_add_unchanged_steps.")
+
+    # --- Discriminator (Stage 4) ---
+    p.add_argument("--warmup_add_adv_steps", type=int, default=25000,
+                   help="Stage 4: activate 3D PatchGAN discriminator at this global step.")
+    p.add_argument("--disc_loss_weight", type=float, default=0.1,
+                   help="Weight of generator adversarial loss (G step).")
+    p.add_argument("--disc_lr", type=float, default=1e-4,
+                   help="Learning rate for the discriminator optimizer.")
 
     # --- AMP ---
     p.add_argument("--amp", action="store_true")
@@ -477,6 +486,33 @@ def build_segmenter(args, device):
         return None, None
 
 
+def build_discriminator(args, device) -> NLayerDiscriminator3D:
+    """
+    3D PatchGAN discriminator — pix2pix/CycleGAN NLayerDiscriminator extended to 3D.
+
+    Uses nn.Conv3d + spectral_norm (no external dependencies beyond PyTorch).
+    Returns a single patch-logit tensor, compatible with hinge/adv loss helpers.
+    With ndf=32, n_layers=3 on a 64³ patch the output map is ~6³.
+    """
+    disc = NLayerDiscriminator3D(in_channels=1, ndf=32, n_layers=3).to(device)
+    n_disc = sum(p.numel() for p in disc.parameters()) / 1e6
+    print(f"[mira3d] Discriminator (3D PatchGAN, spectral norm): {n_disc:.2f}M params")
+    return disc
+
+
+def _disc_hinge_loss(disc: nn.Module, real: torch.Tensor, fake_detached: torch.Tensor) -> torch.Tensor:
+    """Hinge loss for discriminator update. fake must be detached from G graph."""
+    return 0.5 * (
+        F.relu(1.0 - disc(real)).mean()
+        + F.relu(1.0 + disc(fake_detached)).mean()
+    )
+
+
+def _gen_adv_loss(disc: nn.Module, fake: torch.Tensor) -> torch.Tensor:
+    """Generator adversarial loss — maximise D score on fake samples."""
+    return -disc(fake).mean()
+
+
 # ===================================================================
 #  4. VALIDATION  (full-volume sliding-window SR + wandb)
 # ===================================================================
@@ -488,6 +524,14 @@ def hu_window_vis(
     image_hu = image_01 * 2000.0 - 1000.0
     image_hu = np.clip(image_hu, hu_min, hu_max)
     return ((image_hu - hu_min) / (hu_max - hu_min)).astype(np.float32)
+
+
+def _to_wandb_image(arr_01: np.ndarray, caption: str | None = None) -> "wandb.Image":
+    """Convert a 2D [0,1] float32 array to a wandb.Image via PIL (reliable across WandB versions)."""
+    from PIL import Image as _PIL
+    u8 = (np.clip(arr_01, 0.0, 1.0) * 255).astype(np.uint8)
+    pil = _PIL.fromarray(u8, mode="L").convert("RGB")
+    return wandb.Image(pil, caption=caption)
 
 
 def _gaussian_weight(patch_size, sigma_scale=0.625, min_weight=0.01):
@@ -571,6 +615,7 @@ def _sliding_window_sr(
 def validate(
     epoch: int,
     unet, vae, args,
+    accelerator,
     device: torch.device,
     output_dir: str,
 ) -> tuple:
@@ -606,14 +651,14 @@ def validate(
 
     if not pairs:
         print("[mira3d]   val: no nifti paths configured, skipping full-volume validation.")
-        return 0.0, 0.0
+        return 0.0, 0.0, 0.0
 
     val_dir = os.path.join(output_dir, f"val_epoch{epoch:04d}")
     os.makedirs(val_dir, exist_ok=True)
 
     ssim_list, psnr_list = [], []
-    mae100_list, mae_hu_list, bias_hu_list, std_ratio_list = [], [], [], []
-    wandb_log: dict = {}
+    mae_hu_list, bias_hu_list, std_ratio_list = [], [], []
+    img_log: dict = {}   # accumulates wandb.Image lists per view key
 
     for idx, (lr_path, gt_path) in enumerate(pairs):
         case_name = os.path.basename(os.path.dirname(lr_path)) or f"case_{idx}"
@@ -644,25 +689,36 @@ def validate(
 
         # ---- metrics ----
         if gt_vol is not None:
-            ssim_val = structural_similarity(gt_vol, sr_vol, data_range=1.0)
+            # SSIM×100 and PSNR both reported on 0-100 scale for dashboard consistency
+            ssim_val = structural_similarity(gt_vol, sr_vol, data_range=1.0) * 100.0
             psnr_val = peak_signal_noise_ratio(gt_vol, sr_vol, data_range=1.0)
             ssim_list.append(ssim_val)
             psnr_list.append(psnr_val)
 
             sr_hu_v = sr_vol * 2000.0 - 1000.0
             gt_hu_v = gt_vol * 2000.0 - 1000.0
-            mae_hu_val = float(np.mean(np.abs(sr_hu_v - gt_hu_v)))
-            mae100_val = max(0.0, 100.0 * (1.0 - mae_hu_val / 2000.0))
+
+            # Body-masked MAE_HU: exclude air/background (HU < -500) to focus on
+            # clinically relevant tissue where reconstruction quality actually matters.
+            body_mask = gt_hu_v > -500
+            n_body = int(body_mask.sum())
+            if n_body > 0:
+                mae_hu_val = float(np.mean(np.abs((sr_hu_v - gt_hu_v)[body_mask])))
+            else:
+                mae_hu_val = float(np.mean(np.abs(sr_hu_v - gt_hu_v)))
+
+            # Diagnostic-only (console): bias and std ratio
             bias_hu_val = float(np.mean(sr_hu_v - gt_hu_v))
             std_ratio_val = float(np.std(sr_hu_v) / (np.std(gt_hu_v) + 1e-8))
-            mae100_list.append(mae100_val)
+
             mae_hu_list.append(mae_hu_val)
             bias_hu_list.append(bias_hu_val)
             std_ratio_list.append(std_ratio_val)
             print(
-                f"[mira3d]     ssim={ssim_val:.4f}  psnr={psnr_val:.2f}  "
-                f"mae100={mae100_val:.2f}  mae_hu={mae_hu_val:.1f}  "
-                f"bias_hu={bias_hu_val:+.1f}  std_ratio={std_ratio_val:.3f}"
+                f"[mira3d]     ssim={ssim_val:.2f}  psnr={psnr_val:.2f}  "
+                f"mae_hu(body)={mae_hu_val:.1f}  "
+                f"bias_hu={bias_hu_val:+.1f}  std_ratio={std_ratio_val:.3f}  "
+                f"body_voxels={n_body}"
             )
 
         # ---- wandb images: full orthogonal mid-slices ----
@@ -676,39 +732,40 @@ def validate(
                    gt_vol[H // 2, :, :] if gt_vol is not None else None),
         }
         for view_name, (lr_s, sr_s, gt_s) in views.items():
-            key_lr = f"LR ({view_name})"
-            key_sr = f"SR ({view_name})"
-            key_gt = f"GT ({view_name})"
-            wandb_log.setdefault(key_lr, []).append(
-                wandb.Image(hu_window_vis(lr_s), caption=case_name))
-            wandb_log.setdefault(key_sr, []).append(
-                wandb.Image(hu_window_vis(sr_s), caption=case_name))
+            img_log.setdefault(f"val/LR_{view_name}", []).append(
+                _to_wandb_image(hu_window_vis(lr_s), caption=case_name))
+            img_log.setdefault(f"val/SR_{view_name}", []).append(
+                _to_wandb_image(hu_window_vis(sr_s), caption=case_name))
             if gt_s is not None:
-                wandb_log.setdefault(key_gt, []).append(
-                    wandb.Image(hu_window_vis(gt_s), caption=case_name))
+                img_log.setdefault(f"val/GT_{view_name}", []).append(
+                    _to_wandb_image(hu_window_vis(gt_s), caption=case_name))
 
-    mean_ssim = float(np.mean(ssim_list)) if ssim_list else 0.0
+    mean_ssim = float(np.mean(ssim_list)) if ssim_list else 0.0      # already ×100
     mean_psnr = float(np.mean(psnr_list)) if psnr_list else 0.0
-    mean_mae100 = float(np.mean(mae100_list)) if mae100_list else 0.0
     mean_mae_hu = float(np.mean(mae_hu_list)) if mae_hu_list else 0.0
     mean_bias_hu = float(np.mean(bias_hu_list)) if bias_hu_list else 0.0
     mean_std_ratio = float(np.mean(std_ratio_list)) if std_ratio_list else 0.0
 
-    wandb_log["ssim mean"] = mean_ssim
-    wandb_log["psnr mean"] = mean_psnr
-    wandb_log["mae100 mean"] = mean_mae100
-    wandb_log["mae_hu mean"] = mean_mae_hu
-    wandb_log["bias_hu mean"] = mean_bias_hu
-    wandb_log["std_ratio mean"] = mean_std_ratio
-    wandb.log(wandb_log, step=epoch)
+    # Log via accelerator tracker (same pattern as MIRA2D train_text_to_image.py)
+    for tracker in accelerator.trackers:
+        if tracker.name == "wandb":
+            tracker.log(
+                {
+                    **img_log,
+                    "val/ssim":   mean_ssim,    # [0, 100], higher better
+                    "val/psnr":   mean_psnr,    # dB, higher better
+                    "val/mae_hu": mean_mae_hu,  # HU body-masked, lower better
+                },
+                step=epoch,
+            )
 
     print(
         f"[mira3d]   val epoch={epoch:04d}  "
-        f"ssim={mean_ssim:.4f}  psnr={mean_psnr:.2f}  "
-        f"mae100={mean_mae100:.2f}  mae_hu={mean_mae_hu:.1f}  "
+        f"ssim={mean_ssim:.2f}  psnr={mean_psnr:.2f}  "
+        f"mae_hu(body)={mean_mae_hu:.1f}  "
         f"bias_hu={mean_bias_hu:+.1f}  std_ratio={mean_std_ratio:.3f}"
     )
-    return mean_ssim, mean_psnr, mean_mae100
+    return mean_ssim, mean_psnr, mean_mae_hu
 
 
 # ===================================================================
@@ -723,12 +780,18 @@ def train_one_step(
     segmenter,
     seg_preprocess,
     organ_penalties_by_id: dict | None,
+    disc,
     args: argparse.Namespace,
     global_step: int,
     device: torch.device,
     device_type: str,
 ) -> dict:
-    """Single training step. Returns dict of scalar losses."""
+    """
+    Single G training step. Returns dict of scalar losses + recon_hr for D step.
+
+    recon_hr is returned (detached) only when the adversarial stage is active so
+    the D step can compute hinge loss without an extra decode pass.
+    """
     hr = batch["hr"].to(device, non_blocking=True)    # (B,1,H,W,D) [0,1]
     lr = batch["lr"].to(device, non_blocking=True)
     seg_gt = batch["seg"].to(device, non_blocking=True)  # (B,H,W,D)
@@ -756,17 +819,20 @@ def train_one_step(
         aux_seg = torch.tensor(0.0, device=device)
         aux_hu = torch.tensor(0.0, device=device)
         aux_pixel = torch.tensor(0.0, device=device)
+        aux_adv = torch.tensor(0.0, device=device)
+        recon_hr_out = None
 
         # Decode to image space when aux losses are active
         need_decode = (
             global_step >= args.warmup_add_unchanged_steps
             or (segmenter is not None
                 and global_step >= args.warmup_add_seg_hu_steps)
+            or global_step >= args.warmup_add_adv_steps
         )
         if need_decode:
             z_pred = predict_x0_from_noise(z_noisy, noise_pred, t, alphas_cumprod)
             # VAE weights are frozen (requires_grad=False in build_vae); removing
-            # no_grad here lets pixel/UC/HU gradients flow back through the frozen
+            # no_grad here lets pixel/UC/HU/adv gradients flow back through the frozen
             # decode graph to noise_pred → UNet.
             recon_hr = vae.decode(z_pred)
             recon_hu = recon_hr * 2000.0 - 1000.0
@@ -795,6 +861,13 @@ def train_one_step(
                 loss = loss + (args.seg_loss_weight * aux_seg
                                + args.hu_loss_weight * aux_hu)
 
+            # Stage 4: generator adversarial loss from 3D PatchGAN
+            if disc is not None and global_step >= args.warmup_add_adv_steps:
+                aux_adv = _gen_adv_loss(disc, recon_hr.float())
+                loss = loss + args.disc_loss_weight * aux_adv
+                # stash detached copy for the D step (avoids a second decode)
+                recon_hr_out = recon_hr.detach()
+
     return {
         "loss": loss,
         "diff": diff_loss.detach(),
@@ -802,6 +875,8 @@ def train_one_step(
         "uc": aux_uc.detach(),
         "seg": aux_seg.detach(),
         "hu": aux_hu.detach(),
+        "adv": aux_adv.detach(),
+        "recon_hr": recon_hr_out,  # None until Stage 4
     }
 
 
@@ -818,6 +893,7 @@ def main() -> None:
     accelerator = Accelerator(
         mixed_precision="fp16" if args.amp else "no",
         gradient_accumulation_steps=args.gradient_accumulation_steps,
+        log_with="wandb",
     )
     device = accelerator.device
     device_type = device.type
@@ -827,14 +903,18 @@ def main() -> None:
     # Different random seed per rank for data diversity
     seed_everything(args.seed + accelerator.process_index)
 
-    # ---- output dirs + wandb (main process only) ---------------------
+    # ---- output dirs + tracker init ----------------------------------
     model_dir = os.path.join(args.output_dir, "models")
     if accelerator.is_main_process:
         os.makedirs(args.output_dir, exist_ok=True)
         os.makedirs(model_dir, exist_ok=True)
-        wandb.init(project=args.wandb_project, name=args.wandb_run_name,
-                   config=vars(args), dir=args.output_dir)
     accelerator.wait_for_everyone()
+
+    accelerator.init_trackers(
+        project_name=args.wandb_project,
+        config=vars(args),
+        init_kwargs={"wandb": {"name": args.wandb_run_name, "dir": args.output_dir}},
+    )
 
     if accelerator.is_main_process:
         print(f"[mira3d] device={device}  amp={args.amp}  "
@@ -927,14 +1007,20 @@ def main() -> None:
     )
     alphas_cumprod = scheduler.alphas_cumprod.to(device)
 
+    # ---- discriminator -----------------------------------------------
+    disc = build_discriminator(args, device)
+    disc_optimizer = torch.optim.Adam(disc.parameters(), lr=args.disc_lr, betas=(0.5, 0.999))
+
     # ---- optimiser ---------------------------------------------------
     optimizer = torch.optim.Adam(unet.parameters(), lr=args.learning_rate)
     diff_loss_fn = nn.MSELoss() if args.diffusion_loss == "l2" else nn.L1Loss()
 
     # ---- prepare for distributed training ----------------------------
-    # accelerate wraps unet in DDP, patches optimizer with GradScaler when
+    # accelerate wraps unet/disc in DDP, patches optimizers with GradScaler when
     # mixed_precision="fp16", and adds DistributedSampler to the dataloader.
-    unet, optimizer, train_dl = accelerator.prepare(unet, optimizer, train_dl)
+    unet, disc, optimizer, disc_optimizer, train_dl = accelerator.prepare(
+        unet, disc, optimizer, disc_optimizer, train_dl
+    )
 
     # ---- dump config (main process only) -----------------------------
     if accelerator.is_main_process:
@@ -955,20 +1041,25 @@ def main() -> None:
     # ---- training loop -----------------------------------------------
     global_step = 0
     best_ssim = 0.0
-    best_mae100 = 0.0
     logged_shapes = False
 
     for epoch in range(args.num_epochs):
         t0 = time.time()
         unet.train()
+        disc.train()
 
-        acc = {"diff": 0.0, "pixel": 0.0, "uc": 0.0, "seg": 0.0, "hu": 0.0, "total": 0.0}
+        acc = {
+            "diff": 0.0, "pixel": 0.0, "uc": 0.0,
+            "seg": 0.0, "hu": 0.0, "adv": 0.0,
+            "d_loss": 0.0, "total": 0.0,
+        }
         n_batches = 0
 
         for micro_idx, batch in enumerate(
             tqdm(train_dl, desc=f"Epoch {epoch:04d}", dynamic_ncols=True,
                  disable=not accelerator.is_main_process)
         ):
+            # ---- G step (UNet) ----
             with accelerator.accumulate(unet):
                 # accelerator.accumulate() skips DDP gradient sync on
                 # non-boundary steps, and accelerator.backward() handles
@@ -976,7 +1067,7 @@ def main() -> None:
                 out = train_one_step(
                     batch, unet, vae, scheduler, diff_loss_fn,
                     alphas_cumprod, segmenter, seg_preprocess,
-                    organ_penalties_by_id,
+                    organ_penalties_by_id, disc,
                     args, global_step, device, device_type,
                 )
                 accelerator.backward(out["loss"])
@@ -985,14 +1076,30 @@ def main() -> None:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
 
+            # ---- D step (Discriminator) — only when Stage 4 is active ----
+            d_loss_val = 0.0
+            if out["recon_hr"] is not None:
+                hr_real = batch["hr"].to(device, non_blocking=True)
+                with accelerator.accumulate(disc):
+                    with torch.autocast(device_type=device_type, enabled=args.amp):
+                        d_loss = _disc_hinge_loss(
+                            disc, hr_real.float(), out["recon_hr"].float()
+                        )
+                    accelerator.backward(d_loss)
+                    if accelerator.sync_gradients:
+                        accelerator.clip_grad_norm_(disc.parameters(), args.max_grad_norm)
+                    disc_optimizer.step()
+                    disc_optimizer.zero_grad(set_to_none=True)
+                d_loss_val = d_loss.item()
+
             # Shape diagnostic once, main process only
             if not logged_shapes:
                 if accelerator.is_main_process:
-                    hr = batch["hr"]
+                    hr_diag = batch["hr"]
                     with torch.no_grad(), torch.autocast(device_type=device_type, enabled=args.amp):
-                        z_sample = vae_encode_latent(vae, hr[:1].to(device))
+                        z_sample = vae_encode_latent(vae, hr_diag[:1].to(device))
                     print(f"[mira3d] SHAPE DIAGNOSTIC:  "
-                          f"hr={tuple(hr.shape)}  z={tuple(z_sample.shape)}  "
+                          f"hr={tuple(hr_diag.shape)}  z={tuple(z_sample.shape)}  "
                           f"unet_in=({z_sample.shape[0]},{z_sample.shape[1]*2},*{z_sample.shape[2:]})  "
                           f"GPU mem={torch.cuda.max_memory_allocated()/1e9:.1f} GB")
                 logged_shapes = True
@@ -1002,15 +1109,21 @@ def main() -> None:
             acc["uc"] += out["uc"].item()
             acc["seg"] += out["seg"].item()
             acc["hu"] += out["hu"].item()
+            acc["adv"] += out["adv"].item()
+            acc["d_loss"] += d_loss_val
             acc["total"] += out["loss"].item()
             n_batches += 1
 
             if accelerator.sync_gradients:
                 global_step += 1
-                if global_step % args.log_steps == 0 and accelerator.is_main_process:
-                    wandb.log(
-                        {f"train/{k}_loss": out[k].item() for k in ("diff", "pixel", "uc", "seg", "hu")}
-                        | {"train/total_loss": out["loss"].item()},
+                if global_step % args.log_steps == 0:
+                    accelerator.log(
+                        {
+                            **{f"train/{k}_loss": out[k].item()
+                               for k in ("diff", "pixel", "uc", "seg", "hu", "adv")},
+                            "train/total_loss": out["loss"].item(),
+                            "train/d_loss": d_loss_val,
+                        },
                         step=global_step,
                     )
 
@@ -1024,9 +1137,10 @@ def main() -> None:
                 f"total={acc['total']:.5f}  diff={acc['diff']:.5f}  "
                 f"pixel={acc['pixel']:.5f}  uc={acc['uc']:.5f}  "
                 f"seg={acc['seg']:.5f}  hu={acc['hu']:.5f}  "
+                f"adv={acc['adv']:.5f}  d_loss={acc['d_loss']:.5f}  "
                 f"step={global_step}  time={dt:.0f}s"
             )
-            wandb.log({"train/epoch_total": acc["total"]}, step=global_step)
+            accelerator.log({"train/epoch_total": acc["total"]}, step=global_step)
 
         # ---- validation (main process only, with sync barriers) ------
         do_val = (epoch % args.val_interval == 0) or (epoch == args.num_epochs - 1)
@@ -1036,23 +1150,21 @@ def main() -> None:
             accelerator.wait_for_everyone()
             if accelerator.is_main_process:
                 raw_unet = accelerator.unwrap_model(unet)
-                mean_ssim, mean_psnr, mean_mae100 = validate(
-                    epoch, raw_unet, vae, args, device, args.output_dir,
+                mean_ssim, mean_psnr, mean_mae_hu = validate(
+                    epoch, raw_unet, vae, args, accelerator, device, args.output_dir,
                 )
                 if mean_ssim > best_ssim:
                     best_ssim = mean_ssim
-                if mean_mae100 > best_mae100:
-                    best_mae100 = mean_mae100
                     torch.save(raw_unet.state_dict(),
                                os.path.join(model_dir, "unet_best.pt"))
                     with open(os.path.join(model_dir, "best_score_info.txt"), "w") as f:
-                        f.write(f"Best MAE-100: {best_mae100:.4f}\n")
-                        f.write(f"Best SSIM: {mean_ssim:.6f}\n")
-                        f.write(f"Best PSNR: {mean_psnr:.4f}\n")
+                        f.write(f"Best SSIM: {best_ssim:.2f}\n")
+                        f.write(f"PSNR: {mean_psnr:.2f}\n")
+                        f.write(f"MAE_HU (body): {mean_mae_hu:.1f}\n")
                         f.write(f"Epoch: {epoch}\n")
                     print(
-                        f"[mira3d]   -> New best MAE-100={best_mae100:.2f}  "
-                        f"SSIM={mean_ssim:.4f}  PSNR={mean_psnr:.2f}"
+                        f"[mira3d]   -> New best SSIM={best_ssim:.2f}  "
+                        f"PSNR={mean_psnr:.2f}  MAE_HU={mean_mae_hu:.1f}"
                     )
             # Barrier: non-main ranks wait for rank 0 to finish val
             accelerator.wait_for_everyone()
@@ -1060,16 +1172,19 @@ def main() -> None:
         # ---- checkpoints (main process only) -------------------------
         if accelerator.is_main_process:
             raw_unet = accelerator.unwrap_model(unet)
+            raw_disc = accelerator.unwrap_model(disc)
             if args.save_interval > 0 and epoch % args.save_interval == 0:
                 torch.save(raw_unet.state_dict(),
                            os.path.join(model_dir, f"unet_epoch{epoch:04d}.pt"))
             torch.save(raw_unet.state_dict(),
                        os.path.join(model_dir, "unet_latest.pt"))
+            torch.save(raw_disc.state_dict(),
+                       os.path.join(model_dir, "disc_latest.pt"))
 
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
-        wandb.finish()
-        print(f"[mira3d] Done. Best MAE-100={best_mae100:.2f}  Best SSIM={best_ssim:.4f}  Checkpoints: {model_dir}")
+        accelerator.end_training()
+        print(f"[mira3d] Done. Best SSIM={best_ssim:.2f}  Checkpoints: {model_dir}")
 
 
 if __name__ == "__main__":
