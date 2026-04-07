@@ -17,23 +17,23 @@ Reconstruction metrics on the OpenVAE CT hold-out benchmark (12 cases); **SSIM**
 
 | Model | Type | Patients | Latent | Resolution | SSIM | PSNR (dB) | LPIPS |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `stable-diffusion-v1-5` | KL-VAE | 0 | 4ch, 8× downsample | 512×512 RGB | N/A | N/A | N/A |
-| `stable-diffusion-3.5-large` | KL-VAE | 0 | — | — | N/A | N/A | N/A |
-| `MAISI` | KL-VAE | 0 | 4ch, 4× downsample | 64³ patch | — | — | — |
-| `OpenVAE-2D-4x-2K` | KL-VAE | 2K | 4ch, 4× downsample | 512×512 | 0.8932 | 34.87 | 0.0868 |
-| `OpenVAE-2D-4x-10K` | KL-VAE | 10K | 4ch, 4× downsample | 512×512 | 0.8867 | 34.91 | 0.0816 |
-| `OpenVAE-2D-4x-10K-pro` | KL-VAE | 10K | 4ch, 4× downsample | 512×512 | 0.8880 | 34.51 | 0.0781 |
-| `OpenVAE-2D-4x-20K` | KL-VAE | 20K | 4ch, 4× downsample | 512×512 | 0.8798 | 34.63 | 0.0782 |
-| `OpenVAE-2D-4x-100K` | KL-VAE | 100K | 4ch, 4× downsample | 512×512 | 0.8835 | 34.24 | 0.0752 |
-| `OpenVAE-2D-4x-300K` | KL-VAE | 300K | 4ch, 4× downsample | 512×512 | 0.8874 | 33.84 | 0.0852 |
-| `OpenVAE-2D-4x-PCCT_enhanced` | KL-VAE | 300K | 4ch, 4× downsample | 512×512 | 0.8813 | 34.00 | 0.0756 |
-| `OpenVAE-3D-4x-patch64-10K` | KL-VAE | 10K | 4ch, 4× downsample | 64³ patch | 0.8099 | 25.99 | 0.1565 |
-| `OpenVAE-3D-4x-20K` | KL-VAE | 20K | 4ch, 4× downsample | 64³ patch | — | — | — |
-| `OpenVAE-3D-4x-20K` | KL-VAE | 20K | 4ch, 4× downsample | 128³ patch | — | — | — |
-| `OpenVAE-3D-4x-100K` | KL-VAE | 100K | 4ch, 4× downsample | 128³ patch | — | — | — |
-| `OpenVAE-3D-4x-1M` | KL-VAE | 1M | 4ch, 4× downsample | 128³ patch | — | — | — |
-| `OpenVAE-3D-4x-100K-VQ` | VQ-VAE | 100K | 4ch, 4× downsample | 64³ patch | — | — | — |
-| `OpenVAE-3D-8x-100K-VQ` | VQ-VAE | 100K | 4ch, 8× downsample | 64³ patch | — | — | — |
+| [stable-diffusion-v1-5](https://huggingface.co/stable-diffusion-v1-5/stable-diffusion-v1-5) | KL-VAE | 0 | 8× | 512² RGB | N/A | N/A | N/A |
+| [stable-diffusion-3.5-large](https://huggingface.co/stabilityai/stable-diffusion-3.5-large) | KL-VAE | 0 | 8× | — | N/A | N/A | N/A |
+| [MAISI](https://huggingface.co/MONAI/maisi_ct_generative) | KL-VAE | 0 | 4× | 64³ | — | — | — |
+| `OpenVAE-2D-4x-2K` | KL-VAE | 2K | 4× | 512² | 0.8932 | 34.87 | 0.0868 |
+| `OpenVAE-2D-4x-10K` | KL-VAE | 10K | 4× | 512² | 0.8867 | 34.91 | 0.0816 |
+| `OpenVAE-2D-4x-10K-pro` | KL-VAE | 10K | 4× | 512² | 0.8880 | 34.51 | 0.0781 |
+| `OpenVAE-2D-4x-20K` | KL-VAE | 20K | 4× | 512² | 0.8798 | 34.63 | 0.0782 |
+| `OpenVAE-2D-4x-100K` | KL-VAE | 100K | 4× | 512² | 0.8835 | 34.24 | 0.0752 |
+| `OpenVAE-2D-4x-300K` | KL-VAE | 300K | 4× | 512² | 0.8874 | 33.84 | 0.0852 |
+| `OpenVAE-2D-4x-PCCT_enhanced` | KL-VAE | 300K | 4× | 512² | 0.8813 | 34.00 | 0.0756 |
+| `OpenVAE-3D-4x-patch64-10K` | KL-VAE | 10K | 4× | 64³ | 0.8099 | 25.99 | 0.1565 |
+| `OpenVAE-3D-4x-20K` | KL-VAE | 20K | 4× | 64³ | — | — | — |
+| `OpenVAE-3D-4x-20K` | KL-VAE | 20K | 4× | 128³ | — | — | — |
+| `OpenVAE-3D-4x-100K` | KL-VAE | 100K | 4× | 128³ | — | — | — |
+| `OpenVAE-3D-4x-1M` | KL-VAE | 1M | 4× | 128³ | — | — | — |
+| `OpenVAE-3D-4x-100K-VQ` | VQ-VAE | 100K | 4× | 64³ | — | — | — |
+| `OpenVAE-3D-8x-100K-VQ` | VQ-VAE | 100K | 8× | 64³ | — | — | — |
 
 **N/A** — general-domain VAE; not evaluated on the medical CT benchmark above. **—** — checkpoint listed for distribution; benchmark row not run in the current `summary.csv`.
 
@@ -169,7 +169,7 @@ bash scripts/upload_hf_checkpoints.sh
 This uploads `MAISI/maisi_autoencoder.pt` and `OpenVAE-3D-4x-patch64-10K/autoencoder_best.pt` (and `autoencoder_latest.pt`). To refresh the Hub model card, upload `README.md`:
 
 ```bash
-hf upload SMILE-project/OpenVAE README.md --path-in-repo README.md \
+hf upload SMILE-project/OpenVAE README.md README.md \
   --commit-message "docs: merged models + benchmark table and timeline"
 ```
 

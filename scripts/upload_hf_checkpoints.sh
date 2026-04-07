@@ -16,4 +16,4 @@ hf upload "$REPO" "$ROOT/ckpt/OpenVAE-3D-4x-patch64-10K/autoencoder_latest.pt" \
   "OpenVAE-3D-4x-patch64-10K/autoencoder_latest.pt" \
   --commit-message "Add OpenVAE-3D-4x-patch64-10K autoencoder_latest"
 
-echo "Done. Optionally: hf upload $REPO $ROOT/README.md --path-in-repo README.md"
+echo "Done. Optionally: hf upload $REPO $ROOT/README.md README.md --commit-message 'docs: refresh model card'"
