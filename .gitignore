@@ -1,5 +1,7 @@
 # Outputs & checkpoints
-outputs/
+outputs/*
+!outputs/vae_benchmark/
+!outputs/vae_benchmark/summary.csv
 logs/
 ckpt/
 *.pt

@@ -6,22 +6,41 @@ Open-source VAE family for medical imaging. Pretrained latent backbones for CT/M
 
 ![OpenVAE Teaser](docs/OpenVAE.png)
 
-## Models
+## Release timeline
 
-| Model | Type | Patients | Latent | Resolution |
-|---|---|---|---|---|
-| `OpenVAE-2D-4x-20K` | KL-VAE | 20K | 4ch, 4x downsample | 512x512 |
-| `OpenVAE-2D-4x-100K` | KL-VAE | 100K | 4ch, 4x downsample | 512x512 |
-| `OpenVAE-2D-4x-300K` | KL-VAE | 300K | 4ch, 4x downsample | 512x512 |
-| `OpenVAE-2D-4x-PCCT_Enhanced` | KL-VAE | 300K | 4ch, 4x downsample | 512x512 |
-| `OpenVAE-3D-4x-20K` | KL-VAE | 20K | 4ch, 4x downsample | 64^3 patch |
-| `OpenVAE-3D-4x-20K` | KL-VAE | 20K | 4ch, 4x downsample | 128^3 patch |
-| `OpenVAE-3D-4x-100K` | KL-VAE | 100K | 4ch, 4x downsample | 128^3 patch |
-| `OpenVAE-3D-4x-1M` | KL-VAE | 1M | 4ch, 4x downsample | 128^3 patch |
-| `OpenVAE-3D-4x-100K-VQ` | VQ-VAE | 100K | 4ch, 4x downsample | 64^3 patch |
-| `OpenVAE-3D-8x-100K-VQ` | VQ-VAE | 100K | 4ch, 8x downsample | 64^3 patch |
+- **Mar 15, 2026** — 2D OpenVAE weights uploaded to Hugging Face.
+- **Apr 6, 2026** — First 3D 64³ patch checkpoint uploaded (`OpenVAE-3D-4x-patch64-10K`).
 
-## Quick Start
+## Models and CT reconstruction benchmark
+
+Reconstruction metrics on the OpenVAE CT hold-out benchmark (12 cases); **SSIM** and **PSNR** are higher-is-better, **LPIPS** is lower-is-better.
+
+| Model | Type | Patients | Latent | Resolution | SSIM | PSNR (dB) | LPIPS |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `stable-diffusion-v1-5` | KL-VAE | 0 | 4ch, 8× downsample | 512×512 RGB | N/A | N/A | N/A |
+| `stable-diffusion-3.5-large` | KL-VAE | 0 | — | — | N/A | N/A | N/A |
+| `MAISI` | KL-VAE | 0 | 4ch, 4× downsample | 64³ patch | — | — | — |
+| `OpenVAE-2D-4x-2K` | KL-VAE | 2K | 4ch, 4× downsample | 512×512 | 0.8932 | 34.87 | 0.0868 |
+| `OpenVAE-2D-4x-10K` | KL-VAE | 10K | 4ch, 4× downsample | 512×512 | 0.8867 | 34.91 | 0.0816 |
+| `OpenVAE-2D-4x-10K-pro` | KL-VAE | 10K | 4ch, 4× downsample | 512×512 | 0.8880 | 34.51 | 0.0781 |
+| `OpenVAE-2D-4x-20K` | KL-VAE | 20K | 4ch, 4× downsample | 512×512 | 0.8798 | 34.63 | 0.0782 |
+| `OpenVAE-2D-4x-100K` | KL-VAE | 100K | 4ch, 4× downsample | 512×512 | 0.8835 | 34.24 | 0.0752 |
+| `OpenVAE-2D-4x-300K` | KL-VAE | 300K | 4ch, 4× downsample | 512×512 | 0.8874 | 33.84 | 0.0852 |
+| `OpenVAE-2D-4x-PCCT_enhanced` | KL-VAE | 300K | 4ch, 4× downsample | 512×512 | 0.8813 | 34.00 | 0.0756 |
+| `OpenVAE-3D-4x-patch64-10K` | KL-VAE | 10K | 4ch, 4× downsample | 64³ patch | 0.8099 | 25.99 | 0.1565 |
+| `OpenVAE-3D-4x-20K` | KL-VAE | 20K | 4ch, 4× downsample | 64³ patch | — | — | — |
+| `OpenVAE-3D-4x-20K` | KL-VAE | 20K | 4ch, 4× downsample | 128³ patch | — | — | — |
+| `OpenVAE-3D-4x-100K` | KL-VAE | 100K | 4ch, 4× downsample | 128³ patch | — | — | — |
+| `OpenVAE-3D-4x-1M` | KL-VAE | 1M | 4ch, 4× downsample | 128³ patch | — | — | — |
+| `OpenVAE-3D-4x-100K-VQ` | VQ-VAE | 100K | 4ch, 4× downsample | 64³ patch | — | — | — |
+| `OpenVAE-3D-8x-100K-VQ` | VQ-VAE | 100K | 4ch, 8× downsample | 64³ patch | — | — | — |
+
+**N/A** — general-domain VAE; not evaluated on the medical CT benchmark above. **—** — checkpoint listed for distribution; benchmark row not run in the current `summary.csv`.
+
+**Pretrained weights:** [huggingface.co/SMILE-project/OpenVAE](https://huggingface.co/SMILE-project/OpenVAE)
+
+<details>
+<summary><b>Quick Start</b> (2D Diffusers / 3D MONAI)</summary>
 
 ### 2D VAE (Diffusers)
 
@@ -60,17 +79,20 @@ with torch.no_grad():
     x_hat = model.decode(z)     # (1, 1, 64, 64, 64)
 ```
 
-### CT Reconstruction
+### CT reconstruction
 
 ```bash
 # 2D slice-by-slice
 python src/demo_medvae.py --input scan.nii.gz --checkpoint ckpt/OpenVAE-2D-4x-100K
 
-# 3D sliding-window
+# 3D sliding-window (example: 100K checkpoint; use OpenVAE-3D-4x-patch64-10K path for the 10K 64³ model)
 python test/test_3dvae.py --input scan.nii.gz --checkpoint ckpt/OpenVAE-3D-4x-100K/autoencoder_best.pt
 ```
 
-## Training
+</details>
+
+<details>
+<summary><b>Training</b></summary>
 
 ```bash
 # 2D KL-VAE (multi-GPU, Accelerate)
@@ -102,7 +124,10 @@ python src/train_3dvae.py \
 - **HDF5 (default):** `train_data_dir/<subject_id>/ct.h5` — key `"image"`, shape `(H, W, D)`, HU in `[-1000, 1000]`.
 - **NIfTI (`--use-nifti`):** `train_data_dir/<subject_id>/ct.nii.gz` or `ct.nii` — same HU range and shape convention `(H, W, D)`; requires [nibabel](https://nipy.org/nibabel/).
 
-## Benchmark
+</details>
+
+<details>
+<summary><b>Benchmark scripts</b></summary>
 
 ```bash
 # Run reconstruction on all models
@@ -115,20 +140,48 @@ python test/direct_compute_metrics.py --benchmark_root outputs/vae_benchmark --s
 python test/plot_benchmark_metrics.py
 ```
 
-**Metrics** (priority order):
+</details>
+
+<details>
+<summary><b>Metric definitions</b> (MAE / Detail / SSIM / PSNR / LPIPS)</summary>
 
 | Metric | Scale | Direction | Description |
-|---|---|---|---|
-| MAE_100 | 0--100 | higher = better | `(1 - MAE) * 100` on 3D volumes in [0,1] |
-| Detail_100 | 0--100 | higher = better | Pearson corr of 3D gradient magnitudes |
-| SSIM | 0--1 | higher = better | Structural similarity |
+| --- | --- | --- | --- |
+| MAE_100 | 0–100 | higher = better | `(1 - MAE) * 100` on 3D volumes in [0,1] |
+| Detail_100 | 0–100 | higher = better | Pearson corr of 3D gradient magnitudes |
+| SSIM | 0–1 | higher = better | Structural similarity |
 | PSNR | dB | higher = better | Peak signal-to-noise ratio |
-| LPIPS | 0--1 | lower = better | Learned perceptual similarity (AlexNet) |
+| LPIPS | 0–1 | lower = better | Learned perceptual similarity (AlexNet) |
 
-## Project Structure
+Full per-metric dumps (including MAE_100 and Detail_100) live in `outputs/vae_benchmark/summary.csv`.
+
+</details>
+
+<details>
+<summary><b>Upload checkpoints to Hugging Face</b></summary>
+
+After `hf auth login` (token with write access to `SMILE-project/OpenVAE`):
+
+```bash
+bash scripts/upload_hf_checkpoints.sh
+```
+
+This uploads `MAISI/maisi_autoencoder.pt` and `OpenVAE-3D-4x-patch64-10K/autoencoder_best.pt` (and `autoencoder_latest.pt`). To refresh the Hub model card, upload `README.md`:
+
+```bash
+hf upload SMILE-project/OpenVAE README.md --path-in-repo README.md \
+  --commit-message "docs: merged models + benchmark table and timeline"
+```
+
+</details>
+
+<details>
+<summary><b>Project structure</b></summary>
 
 ```
 OpenVAE/
+├── scripts/
+│   └── upload_hf_checkpoints.sh  # Push MAISI + 3D patch64-10K to Hugging Face Hub
 ├── src/
 │   ├── train_klvae.py            # 2D KL-VAE training (Diffusers + Accelerate)
 │   ├── train_3dvae.py            # 3D VAE training (MONAI MAISI)
@@ -146,7 +199,10 @@ OpenVAE/
 └── ckpt/                         # Model checkpoints (download from HF)
 ```
 
-## Citation
+</details>
+
+<details>
+<summary><b>Citation</b></summary>
 
 ```bibtex
 @article{liu2025see,
@@ -157,10 +213,8 @@ OpenVAE/
 }
 ```
 
+</details>
+
 ## License
 
 MIT
-
----
-
-**Pretrained weights:** [huggingface.co/SMILE-project/OpenVAE](https://huggingface.co/SMILE-project/OpenVAE)
