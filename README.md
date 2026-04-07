@@ -8,6 +8,8 @@ Open-source VAE family for medical imaging. Pretrained latent backbones for CT/M
 
 ## Release timeline
 
+[![Hugging Face — SMILE-project/OpenVAE](https://img.shields.io/badge/Hugging_Face-SMILE--project%2FOpenVAE-FFD21E?style=for-the-badge&logo=huggingface&logoColor=black)](https://huggingface.co/SMILE-project/OpenVAE)
+
 - **Mar 15, 2026** — 2D OpenVAE weights uploaded to Hugging Face.
 - **Apr 6, 2026** — First 3D 64³ patch checkpoint uploaded (`OpenVAE-3D-4x-patch64-10K`).
 
@@ -34,6 +36,17 @@ Reconstruction metrics on the OpenVAE CT hold-out benchmark (12 cases); **SSIM**
 | `OpenVAE-3D-4x-1M` | KL-VAE | 1M | 4× | 128³ | — | — | — |
 | `OpenVAE-3D-4x-100K-VQ` | VQ-VAE | 100K | 4× | 64³ | — | — | — |
 | `OpenVAE-3D-8x-100K-VQ` | VQ-VAE | 100K | 8× | 64³ | — | — | — |
+
+**Paper** — if you use OpenVAE or these benchmarks, please cite:
+
+```bibtex
+@article{liu2025see,
+  title={See More, Change Less: Anatomy-Aware Diffusion for Contrast Enhancement},
+  author={Liu, Junqi and Wu, Zejun and Bassi, Pedro RAS and Zhou, Xinze and Li, Wenxuan and Hamamci, Ibrahim E and Er, Sezgin and Lin, Tianyu and Luo, Yi and P{\l}otka, Szymon and others},
+  journal={arXiv preprint arXiv:2512.07251},
+  year={2025}
+}
+```
 
 **N/A** — general-domain VAE; not evaluated on the medical CT benchmark above. **—** — checkpoint listed for distribution; benchmark row not run in the current `summary.csv`.
 
