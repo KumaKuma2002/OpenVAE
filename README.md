@@ -1,8 +1,25 @@
+---
+license: mit
+library_name: diffusers
+arxiv: https://arxiv.org/abs/2604.07329
+tags:
+  - medical
+  - computed-tomography
+  - vae
+  - diffusion
+---
+
 # OpenVAE
+
+[![arXiv](https://img.shields.io/badge/arXiv-2604.07329-b31b1b.svg)](https://arxiv.org/abs/2604.07329)
+[![GitHub](https://img.shields.io/badge/GitHub-KumaKuma2002%2FOpenVAE-181717?logo=github)](https://github.com/KumaKuma2002/OpenVAE)
+[![Hugging Face](https://img.shields.io/badge/HF-SMILE--project%2FOpenVAE-FFD21E?logo=huggingface&logoColor=black)](https://huggingface.co/SMILE-project/OpenVAE)
 
 Open-source VAE family for medical imaging. Pretrained latent backbones for CT/MRI diffusion models.
 
 2D and 3D autoencoders trained on up to 1M CT volumes with perceptual, adversarial, and segmentation-guided objectives.
+
+**Main paper:** [Distilling Photon-Counting CT into Routine Chest CT through Clinically Validated Degradation Modeling](https://arxiv.org/abs/2604.07329) ([PDF](https://arxiv.org/pdf/2604.07329)) — cite this work when you use OpenVAE weights, released CT latents, or related resources from this repository. **Code:** [github.com/KumaKuma2002/OpenVAE](https://github.com/KumaKuma2002/OpenVAE).
 
 ![OpenVAE Teaser](docs/OpenVAE.png)
 
@@ -37,7 +54,23 @@ Reconstruction metrics on the OpenVAE CT hold-out benchmark (12 cases); **SSIM**
 | `OpenVAE-3D-4x-100K-VQ` | VQ-VAE | 100K | 4× | 64³ | — | — | — |
 | `OpenVAE-3D-8x-100K-VQ` | VQ-VAE | 100K | 8× | 64³ | — | — | — |
 
-**Paper** — if you use OpenVAE or these benchmarks, please cite:
+**Citation** — please cite the **primary** paper below for OpenVAE. If you build on the earlier anatomy-aware contrast-enhancement line or compare against that benchmark framing, also cite the **related** work.
+
+**Primary (OpenVAE / SUMI, arXiv:2604.07329):**
+
+```bibtex
+@misc{liu2026distillingphotoncountingctroutine,
+  title={Distilling Photon-Counting CT into Routine Chest CT through Clinically Validated Degradation Modeling},
+  author={Junqi Liu and Xinze Zhou and Wenxuan Li and Scott Ye and Arkadiusz Sitek and Xiaofeng Yang and Yucheng Tang and Daguang Xu and Kai Ding and Kang Wang and Yang Yang and Alan L. Yuille and Zongwei Zhou},
+  year={2026},
+  eprint={2604.07329},
+  archivePrefix={arXiv},
+  primaryClass={cs.CV},
+  url={https://arxiv.org/abs/2604.07329},
+}
+```
+
+**Related (anatomy-aware contrast enhancement, arXiv:2512.07251):**
 
 ```bibtex
 @article{liu2025see,
@@ -216,6 +249,24 @@ OpenVAE/
 
 <details>
 <summary><b>Citation</b></summary>
+
+Same as the **Citation** block above: **primary** OpenVAE paper ([arXiv:2604.07329](https://arxiv.org/abs/2604.07329)), optional **related** contrast-enhancement paper ([arXiv:2512.07251](https://arxiv.org/abs/2512.07251)).
+
+**Primary:**
+
+```bibtex
+@misc{liu2026distillingphotoncountingctroutine,
+  title={Distilling Photon-Counting CT into Routine Chest CT through Clinically Validated Degradation Modeling},
+  author={Junqi Liu and Xinze Zhou and Wenxuan Li and Scott Ye and Arkadiusz Sitek and Xiaofeng Yang and Yucheng Tang and Daguang Xu and Kai Ding and Kang Wang and Yang Yang and Alan L. Yuille and Zongwei Zhou},
+  year={2026},
+  eprint={2604.07329},
+  archivePrefix={arXiv},
+  primaryClass={cs.CV},
+  url={https://arxiv.org/abs/2604.07329},
+}
+```
+
+**Related:**
 
 ```bibtex
 @article{liu2025see,
